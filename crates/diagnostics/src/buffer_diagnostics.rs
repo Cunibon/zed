@@ -1,6 +1,7 @@
 use crate::{
-    DIAGNOSTICS_UPDATE_DEBOUNCE, IncludeWarnings, ToggleWarnings, context_range_for_entry,
+    DIAGNOSTICS_UPDATE_DEBOUNCE, PanelMaxSeverity, ToggleWarnings, context_range_for_entry,
     diagnostic_renderer::{DiagnosticBlock, DiagnosticRenderer},
+    initial_max_severity, toggled_warnings_severity,
     toolbar_controls::DiagnosticsToolbarEditor,
 };
 use anyhow::Result;
@@ -20,7 +21,7 @@ use project::{
     DiagnosticSummary, Event, Project, ProjectItem, ProjectPath,
     project_settings::{DiagnosticSeverity, ProjectSettings},
 };
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
     cmp::{self, Ordering},
@@ -29,6 +30,7 @@ use std::{
 };
 use text::{Anchor, BufferSnapshot, OffsetRangeExt};
 use ui::{Button, ButtonStyle, Icon, IconName, Label, Tooltip, h_flex, prelude::*};
+use util::ResultExt as _;
 use workspace::{
     ItemHandle, ItemNavHistory, Workspace,
     item::{Item, ItemEvent, TabContentParams},
@@ -67,9 +69,11 @@ pub(crate) struct BufferDiagnosticsEditor {
     /// Summary of the number of warnings and errors for the path. Used to
     /// display the number of warnings and errors in the tab's content.
     summary: DiagnosticSummary,
-    /// Whether to include warnings in the list of diagnostics shown in the
-    /// editor.
-    pub(crate) include_warnings: bool,
+    /// The most lenient severity shown in the editor.
+    pub(crate) max_severity: DiagnosticSeverity,
+    /// The threshold last read from settings, so that only a change to the
+    /// setting itself moves the shared threshold.
+    settings_max_severity: DiagnosticSeverity,
     /// Keeps track of whether there's a background task already running to
     /// update the excerpts, in order to avoid firing multiple tasks for this purpose.
     pub(crate) update_excerpts_task: Option<Task<Result<()>>>,
@@ -85,7 +89,7 @@ impl BufferDiagnosticsEditor {
         project_path: ProjectPath,
         project_handle: Entity<Project>,
         buffer: Option<Entity<Buffer>>,
-        include_warnings: bool,
+        max_severity: DiagnosticSeverity,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -147,7 +151,6 @@ impl BufferDiagnosticsEditor {
             .diagnostic_summary_for_path(&project_path, cx);
 
         let multibuffer = cx.new(|cx| MultiBuffer::new(project_handle.read(cx).capability()));
-        let max_severity = Self::max_diagnostics_severity(include_warnings);
         let editor = cx.new(|cx| {
             let mut editor = Editor::for_multibuffer(
                 multibuffer.clone(),
@@ -188,6 +191,26 @@ impl BufferDiagnosticsEditor {
         )
         .detach();
 
+        cx.observe_global_in::<PanelMaxSeverity>(
+            window,
+            |buffer_diagnostics_editor, window, cx| {
+                let max_severity = cx.global::<PanelMaxSeverity>().0;
+                if max_severity == buffer_diagnostics_editor.max_severity {
+                    return;
+                }
+                buffer_diagnostics_editor.apply_max_severity(max_severity, window, cx);
+            },
+        )
+        .detach();
+        cx.observe_global::<SettingsStore>(|buffer_diagnostics_editor, cx| {
+            let max_severity = ProjectSettings::get_global(cx).diagnostics.max_severity;
+            if max_severity != buffer_diagnostics_editor.settings_max_severity {
+                buffer_diagnostics_editor.settings_max_severity = max_severity;
+                cx.set_global(PanelMaxSeverity(max_severity));
+            }
+        })
+        .detach();
+
         let diagnostics = vec![];
         let update_excerpts_task = None;
         let mut buffer_diagnostics_editor = Self {
@@ -200,7 +223,8 @@ impl BufferDiagnosticsEditor {
             buffer,
             project_path,
             summary,
-            include_warnings,
+            max_severity,
+            settings_max_severity: ProjectSettings::get_global(cx).diagnostics.max_severity,
             update_excerpts_task,
             _subscription: project_event_subscription,
         };
@@ -232,17 +256,14 @@ impl BufferDiagnosticsEditor {
             if let Some(editor) = existing_editor {
                 workspace.activate_item(&editor, true, true, window, cx);
             } else {
-                let include_warnings = match cx.try_global::<IncludeWarnings>() {
-                    Some(include_warnings) => include_warnings.0,
-                    None => ProjectSettings::get_global(cx).diagnostics.include_warnings,
-                };
+                let max_severity = initial_max_severity(cx);
 
                 let item = cx.new(|cx| {
                     Self::new(
                         project_path,
                         workspace.project().clone(),
                         editor.read(cx).buffer().read(cx).as_singleton(),
-                        include_warnings,
+                        max_severity,
                         window,
                         cx,
                     )
@@ -316,9 +337,10 @@ impl BufferDiagnosticsEditor {
         let multibuffer_context = multibuffer_context_lines(cx);
         let buffer_snapshot = buffer.read(cx).snapshot();
         let buffer_snapshot_max = buffer_snapshot.max_point();
-        let max_severity = Self::max_diagnostics_severity(self.include_warnings)
+        let max_severity = self
+            .max_severity
             .into_lsp()
-            .unwrap_or(lsp::DiagnosticSeverity::WARNING);
+            .unwrap_or(lsp::DiagnosticSeverity::ERROR);
 
         cx.spawn_in(window, async move |buffer_diagnostics_editor, mut cx| {
             // Fetch the diagnostics for the whole of the buffer
@@ -644,26 +666,32 @@ impl BufferDiagnosticsEditor {
     pub fn toggle_warnings(
         &mut self,
         _: &ToggleWarnings,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_max_severity(toggled_warnings_severity(self.max_severity), cx);
+    }
+
+    pub(crate) fn set_max_severity(
+        &mut self,
+        max_severity: DiagnosticSeverity,
+        cx: &mut Context<Self>,
+    ) {
+        cx.set_global(PanelMaxSeverity(max_severity));
+    }
+
+    fn apply_max_severity(
+        &mut self,
+        max_severity: DiagnosticSeverity,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let include_warnings = !self.include_warnings;
-        let max_severity = Self::max_diagnostics_severity(include_warnings);
-
+        self.max_severity = max_severity;
         self.editor.update(cx, |editor, cx| {
             editor.set_max_diagnostics_severity(max_severity, cx);
         });
-
-        self.include_warnings = include_warnings;
         self.diagnostics.clear();
         self.update_all_diagnostics(window, cx);
-    }
-
-    fn max_diagnostics_severity(include_warnings: bool) -> DiagnosticSeverity {
-        match include_warnings {
-            true => DiagnosticSeverity::Warning,
-            false => DiagnosticSeverity::Error,
-        }
     }
 
     #[cfg(test)]
@@ -736,7 +764,7 @@ impl Item for BufferDiagnosticsEditor {
                 self.project_path.clone(),
                 self.project.clone(),
                 self.buffer.clone(),
-                self.include_warnings,
+                self.max_severity,
                 window,
                 cx,
             )
@@ -893,12 +921,13 @@ impl Render for BufferDiagnosticsEditor {
         let path_style = self.project.read(cx).path_style(cx);
         let filename = self.project_path.path.display(path_style).to_string();
         let error_count = self.summary.error_count;
-        let warning_count = match self.include_warnings {
-            true => self.summary.warning_count,
-            false => 0,
+        let warning_count = if self.max_severity >= DiagnosticSeverity::Warning {
+            self.summary.warning_count
+        } else {
+            0
         };
 
-        let child = if error_count + warning_count == 0 {
+        let child = if error_count + warning_count == 0 && self.editor.read(cx).is_empty(cx) {
             let label = match warning_count {
                 0 => "No problems in",
                 _ => "No errors in",
@@ -969,11 +998,11 @@ impl Render for BufferDiagnosticsEditor {
 }
 
 impl DiagnosticsToolbarEditor for WeakEntity<BufferDiagnosticsEditor> {
-    fn include_warnings(&self, cx: &App) -> bool {
+    fn max_severity(&self, cx: &App) -> DiagnosticSeverity {
         self.read_with(cx, |buffer_diagnostics_editor, _cx| {
-            buffer_diagnostics_editor.include_warnings
+            buffer_diagnostics_editor.max_severity
         })
-        .unwrap_or(false)
+        .unwrap_or(DiagnosticSeverity::Warning)
     }
 
     fn is_updating(&self, cx: &App) -> bool {
@@ -1002,10 +1031,11 @@ impl DiagnosticsToolbarEditor for WeakEntity<BufferDiagnosticsEditor> {
         });
     }
 
-    fn toggle_warnings(&self, window: &mut Window, cx: &mut App) {
-        let _ = self.update(cx, |buffer_diagnostics_editor, cx| {
-            buffer_diagnostics_editor.toggle_warnings(&Default::default(), window, cx);
-        });
+    fn set_max_severity(&self, max_severity: DiagnosticSeverity, cx: &mut App) {
+        self.update(cx, |buffer_diagnostics_editor, cx| {
+            buffer_diagnostics_editor.set_max_severity(max_severity, cx);
+        })
+        .log_err();
     }
 
     fn get_diagnostics_for_buffer(

@@ -1,7 +1,11 @@
-use crate::{BufferDiagnosticsEditor, ProjectDiagnosticsEditor, ToggleDiagnosticsRefresh};
+use crate::{
+    BufferDiagnosticsEditor, ProjectDiagnosticsEditor, ToggleDiagnosticsRefresh,
+    toggled_warnings_severity,
+};
 use agent_settings::AgentSettings;
 use gpui::{Context, EventEmitter, ParentElement, Render, Window};
 use language::DiagnosticEntry;
+use project::project_settings::DiagnosticSeverity;
 use settings::Settings;
 use text::{Anchor, BufferId};
 use ui::{Tooltip, prelude::*};
@@ -14,11 +18,10 @@ pub struct ToolbarControls {
 }
 
 pub(crate) trait DiagnosticsToolbarEditor: Send + Sync {
-    /// Informs the toolbar whether warnings are included in the diagnostics.
-    fn include_warnings(&self, cx: &App) -> bool;
-    /// Toggles whether warning diagnostics should be displayed by the
-    /// diagnostics editor.
-    fn toggle_warnings(&self, window: &mut Window, cx: &mut App);
+    /// The most lenient severity the diagnostics editor currently shows.
+    fn max_severity(&self, cx: &App) -> DiagnosticSeverity;
+    /// Changes the most lenient severity the diagnostics editor shows.
+    fn set_max_severity(&self, max_severity: DiagnosticSeverity, cx: &mut App);
     /// Indicates whether the diagnostics editor is currently updating the
     /// diagnostics.
     fn is_updating(&self, cx: &App) -> bool;
@@ -37,16 +40,17 @@ pub(crate) trait DiagnosticsToolbarEditor: Send + Sync {
 
 impl Render for ToolbarControls {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut include_warnings = false;
+        let mut max_severity = DiagnosticSeverity::Warning;
         let mut is_updating = false;
 
         match &self.editor {
             Some(editor) => {
-                include_warnings = editor.include_warnings(cx);
+                max_severity = editor.max_severity(cx);
                 is_updating = editor.is_updating(cx);
             }
             None => {}
         }
+        let include_warnings = max_severity >= DiagnosticSeverity::Warning;
 
         let is_agent_enabled = AgentSettings::get_global(cx).enabled(cx);
 
@@ -122,9 +126,12 @@ impl Render for ToolbarControls {
                     .icon_color(warning_color)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text(warning_tooltip))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(|this, _, _window, cx| {
                         if let Some(editor) = &this.editor {
-                            editor.toggle_warnings(window, cx)
+                            editor.set_max_severity(
+                                toggled_warnings_severity(editor.max_severity(cx)),
+                                cx,
+                            )
                         }
                     })),
             )
