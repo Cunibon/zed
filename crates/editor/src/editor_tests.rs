@@ -39223,6 +39223,8 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
                     button: Some(true),
                     notifications: None,
                     semantic_token_rules: None,
+                    suspend_after_inactive_minutes: None,
+                    max_active_projects: None,
                 });
             });
         });
@@ -39326,6 +39328,8 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
                     button: Some(true),
                     notifications: None,
                     semantic_token_rules: None,
+                    suspend_after_inactive_minutes: None,
+                    max_active_projects: None,
                 });
             });
         });

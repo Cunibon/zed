@@ -1947,6 +1947,8 @@ While other options may be changed at a runtime and should be placed under `sett
     "button": true,
     "request_timeout": 120,
     "max_buffer_line_length": 20000,
+    "suspend_after_inactive_minutes": null,
+    "max_active_projects": null,
     "notifications": {
       // Timeout in milliseconds for automatically dismissing language server notifications.
       // Set to 0 to disable auto-dismiss.
@@ -1961,6 +1963,8 @@ While other options may be changed at a runtime and should be placed under `sett
 - `button`: Whether to show the LSP status button in the status bar
 - `request_timeout`: The maximum amount of time to wait for responses from language servers, in seconds. A value of `0` will result in no timeout being applied (causing all LSP responses to wait indefinitely until completed). Default: `120`
 - `max_buffer_line_length`: The maximum line length a buffer may contain before Zed disables all language server features for that entire buffer. If any line exceeds this value, Zed does not open the buffer with language servers or send them buffer-specific requests. Default: `20000`
+- `suspend_after_inactive_minutes`: How many minutes a project's window may stay inactive before its language servers are suspended. Suspended servers are shut down to free memory and are listed as "Suspended" in the language server menu; they start again as soon as the window becomes active. This keeps several windows of a large monorepo (for example a Flutter monorepo, where every window runs its own Dart analysis server) from each holding gigabytes of memory while only one of them is in use. Default: `null` (never suspend)
+- `max_active_projects`: The maximum number of projects that may run language servers at the same time. Activating a window beyond this budget suspends the language servers of the least recently active project; they start again when that window becomes active. Default: `null` (unlimited)
 - `notifications`: Notification-related settings.
   - `dismiss_timeout_ms`: Timeout in milliseconds for automatically dismissing language server notifications. Set to 0 to disable auto-dismiss.
 
