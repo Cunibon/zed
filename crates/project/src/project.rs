@@ -4177,6 +4177,18 @@ impl Project {
         })
     }
 
+    /// Tells the project whether a window showing it is active, which drives the suspension
+    /// of its language servers (see `global_lsp_settings.suspend_after_inactive_minutes` and
+    /// `global_lsp_settings.max_active_projects`).
+    pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.lsp_store
+            .update(cx, |lsp_store, cx| lsp_store.set_window_active(active, cx));
+    }
+
+    pub fn is_window_active(&self, cx: &App) -> bool {
+        self.lsp_store.read(cx).is_window_active()
+    }
+
     pub fn restart_language_servers_for_buffers(
         &mut self,
         buffers: Vec<Entity<Buffer>>,

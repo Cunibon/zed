@@ -4200,6 +4200,387 @@ async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppConte
     assert_matches!(configured[0].state, ConfiguredServerState::Failed(_));
 }
 
+struct SuspensionFixture {
+    project: Entity<Project>,
+    lsp_store: Entity<LspStore>,
+    fake_rust_servers: futures::channel::mpsc::UnboundedReceiver<lsp::FakeLanguageServer>,
+}
+
+async fn suspension_fixture(
+    fs: Arc<FakeFs>,
+    root: &Path,
+    cx: &mut gpui::TestAppContext,
+) -> SuspensionFixture {
+    let project = Project::test(fs, [root], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+    SuspensionFixture {
+        project,
+        lsp_store,
+        fake_rust_servers,
+    }
+}
+
+fn set_suspension_settings(
+    suspend_after_inactive_minutes: Option<u64>,
+    max_active_projects: Option<usize>,
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |settings, cx| {
+            settings.update_user_settings(cx, |settings| {
+                settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                    suspend_after_inactive_minutes,
+                    max_active_projects,
+                    ..Default::default()
+                });
+            });
+        })
+    });
+    cx.executor().run_until_parked();
+}
+
+fn configured_server_states(
+    lsp_store: &Entity<LspStore>,
+    cx: &mut gpui::TestAppContext,
+) -> Vec<project::lsp_store::ConfiguredServerState> {
+    lsp_store.read_with(cx, |lsp_store, _| {
+        lsp_store
+            .configured_language_servers()
+            .into_iter()
+            .map(|server| server.state)
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn test_language_servers_suspend_after_inactivity(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(Some(1), None, cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let SuspensionFixture {
+        project,
+        lsp_store,
+        mut fake_rust_servers,
+    } = suspension_fixture(fs, path!("/dir").as_ref(), cx).await;
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_1 = fake_rust_servers.next().await.unwrap();
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    project.update(cx, |project, cx| project.set_window_active(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(61));
+    cx.executor().run_until_parked();
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("the language server should exit once the window has been idle long enough");
+    cx.executor().run_until_parked();
+    let states = configured_server_states(&lsp_store, cx);
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_matches!(states[0], ConfiguredServerState::Suspended { .. });
+
+    project.update(cx, |project, cx| project.set_window_active(true, cx));
+    let mut fake_rust_server_2 = fake_rust_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("a language server should start again when the window becomes active")
+        .unwrap();
+    assert_eq!(
+        fake_rust_server_2
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
+    );
+    cx.executor().run_until_parked();
+    assert_eq!(
+        configured_server_states(&lsp_store, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server_2.server.server_id()
+        )]
+    );
+}
+
+#[gpui::test]
+async fn test_reactivation_cancels_pending_suspension(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(Some(1), None, cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let SuspensionFixture {
+        project,
+        lsp_store,
+        mut fake_rust_servers,
+    } = suspension_fixture(fs, path!("/dir").as_ref(), cx).await;
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server = fake_rust_servers.next().await.unwrap();
+    fake_rust_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    project.update(cx, |project, cx| project.set_window_active(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.executor().run_until_parked();
+    project.update(cx, |project, cx| project.set_window_active(true, cx));
+    cx.executor().advance_clock(Duration::from_secs(120));
+    cx.executor().run_until_parked();
+
+    assert!(
+        fake_rust_server
+            .try_receive_notification::<lsp::notification::Exit>()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "re-activating the window must cancel the pending suspension"
+    );
+    assert!(
+        fake_rust_servers.next().now_or_never().flatten().is_none(),
+        "no new language server should have been started"
+    );
+    assert_eq!(
+        configured_server_states(&lsp_store, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server.server.server_id()
+        )]
+    );
+}
+
+#[gpui::test]
+async fn test_suspension_disabled_by_default(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let SuspensionFixture {
+        project,
+        lsp_store,
+        mut fake_rust_servers,
+    } = suspension_fixture(fs, path!("/dir").as_ref(), cx).await;
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server = fake_rust_servers.next().await.unwrap();
+    fake_rust_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    project.update(cx, |project, cx| project.set_window_active(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(60 * 60));
+    cx.executor().run_until_parked();
+
+    assert!(
+        fake_rust_server
+            .try_receive_notification::<lsp::notification::Exit>()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "language servers must keep running while suspension is not configured"
+    );
+    assert_eq!(
+        configured_server_states(&lsp_store, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server.server.server_id()
+        )]
+    );
+}
+
+#[gpui::test]
+async fn test_user_stopped_servers_stay_stopped_across_suspend_resume(
+    cx: &mut gpui::TestAppContext,
+) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(Some(1), None, cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let SuspensionFixture {
+        project,
+        lsp_store,
+        mut fake_rust_servers,
+    } = suspension_fixture(fs, path!("/dir").as_ref(), cx).await;
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server = fake_rust_servers.next().await.unwrap();
+    fake_rust_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    fake_rust_server
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+    cx.executor().run_until_parked();
+    assert_eq!(
+        configured_server_states(&lsp_store, cx),
+        vec![ConfiguredServerState::Stopped]
+    );
+
+    project.update(cx, |project, cx| project.set_window_active(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(61));
+    cx.executor().run_until_parked();
+    project.update(cx, |project, cx| project.set_window_active(true, cx));
+    cx.executor().run_until_parked();
+
+    assert!(
+        fake_rust_servers.next().now_or_never().flatten().is_none(),
+        "resuming from suspension must not revive servers the user stopped"
+    );
+    assert_eq!(
+        configured_server_states(&lsp_store, cx),
+        vec![ConfiguredServerState::Stopped]
+    );
+}
+
+#[gpui::test]
+async fn test_max_active_projects_budget(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(None, Some(1), cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir_a"), json!({ "a.rs": "" })).await;
+    fs.insert_tree(path!("/dir_b"), json!({ "b.rs": "" })).await;
+    let SuspensionFixture {
+        project: project_a,
+        lsp_store: lsp_store_a,
+        fake_rust_servers: mut fake_rust_servers_a,
+    } = suspension_fixture(fs.clone(), path!("/dir_a").as_ref(), cx).await;
+    let SuspensionFixture {
+        project: project_b,
+        lsp_store: lsp_store_b,
+        fake_rust_servers: mut fake_rust_servers_b,
+    } = suspension_fixture(fs, path!("/dir_b").as_ref(), cx).await;
+
+    project_a.update(cx, |project, cx| project.set_window_active(true, cx));
+    let (_buffer_a, _handle_a) = project_a
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir_a/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_a1 = fake_rust_servers_a.next().await.unwrap();
+    fake_rust_server_a1
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    // Activating a second project exceeds the budget of one, so the least recently
+    // active project gives up its servers.
+    project_b.update(cx, |project, cx| project.set_window_active(true, cx));
+    fake_rust_server_a1
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project A's server should exit once project B becomes active");
+    cx.executor().run_until_parked();
+    let states_a = configured_server_states(&lsp_store_a, cx);
+    assert_eq!(states_a.len(), 1, "{states_a:?}");
+    assert_matches!(states_a[0], ConfiguredServerState::Suspended { .. });
+
+    let (_buffer_b, _handle_b) = project_b
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir_b/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_b1 = fake_rust_servers_b
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("the active project B should start its server")
+        .unwrap();
+    assert_eq!(
+        fake_rust_server_b1
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir_b/b.rs")
+    );
+
+    // Coming back to project A resumes it and suspends project B in turn.
+    project_a.update(cx, |project, cx| project.set_window_active(true, cx));
+    let mut fake_rust_server_a2 = fake_rust_servers_a
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project A's server should start again when it becomes active")
+        .unwrap();
+    assert_eq!(
+        fake_rust_server_a2
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir_a/a.rs")
+    );
+    fake_rust_server_b1
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project B's server should exit once project A becomes active again");
+    cx.executor().run_until_parked();
+    assert_eq!(
+        configured_server_states(&lsp_store_a, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server_a2.server.server_id()
+        )]
+    );
+    let states_b = configured_server_states(&lsp_store_b, cx);
+    assert_eq!(states_b.len(), 1, "{states_b:?}");
+    assert_matches!(states_b[0], ConfiguredServerState::Suspended { .. });
+}
+
 #[gpui::test]
 async fn test_updating_lsp_settings_sends_one_did_change_configuration(
     cx: &mut gpui::TestAppContext,

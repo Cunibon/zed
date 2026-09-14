@@ -329,6 +329,47 @@ impl ConfiguredServerState {
     }
 }
 
+/// Tracks the local projects of this app by the time their window was last active, so that
+/// activating one project can suspend the language servers of the least recently active
+/// projects when `max_active_projects` is set.
+#[derive(Default)]
+pub struct LspActivityCoordinator {
+    projects: Vec<(WeakEntity<LspStore>, Instant)>,
+}
+
+impl gpui::Global for LspActivityCoordinator {}
+
+impl LspActivityCoordinator {
+    fn register(&mut self, lsp_store: WeakEntity<LspStore>, active_at: Instant) {
+        self.prune_dropped_projects();
+        self.projects.push((lsp_store, active_at));
+    }
+
+    /// Records `lsp_store` as the most recently active project and returns the other
+    /// registered projects, least recently active first.
+    fn record_activation(
+        &mut self,
+        lsp_store: WeakEntity<LspStore>,
+        active_at: Instant,
+    ) -> Vec<WeakEntity<LspStore>> {
+        self.prune_dropped_projects();
+        self.projects
+            .retain(|(registered, _)| registered.entity_id() != lsp_store.entity_id());
+        let other_projects = self
+            .projects
+            .iter()
+            .map(|(registered, _)| registered.clone())
+            .collect();
+        self.projects.push((lsp_store, active_at));
+        other_projects
+    }
+
+    fn prune_dropped_projects(&mut self) {
+        self.projects
+            .retain(|(lsp_store, _)| lsp_store.upgrade().is_some());
+    }
+}
+
 #[derive(Debug)]
 pub struct DocumentDiagnosticsUpdate<'a, D> {
     pub diagnostics: D,
@@ -463,6 +504,44 @@ impl LocalLspStore {
 
     fn clear_all_suppressions(&mut self) {
         self.suppressed_servers.clear();
+    }
+
+    /// Marks every server of the project suspended and reports whether anything changed.
+    /// Servers the user stopped as a whole stay stopped instead: nothing of theirs is running,
+    /// and the stop must survive the resume.
+    fn suspend_all_servers(&mut self) -> bool {
+        let all_servers = SuppressionKey {
+            worktree_id: None,
+            name: None,
+        };
+        if self.suppressed_servers.contains_key(&all_servers) {
+            return false;
+        }
+        self.suppressed_servers.insert(
+            all_servers,
+            SuppressionReason::Suspended {
+                since: Instant::now(),
+            },
+        );
+        true
+    }
+
+    /// Lifts every suppression whose reason matches and reports whether any was lifted.
+    fn clear_suppressions_with_reason(
+        &mut self,
+        should_clear: impl Fn(&SuppressionReason) -> bool,
+    ) -> bool {
+        let suppressions_before = self.suppressed_servers.len();
+        self.suppressed_servers
+            .retain(|_, reason| !should_clear(reason));
+        self.suppressed_servers.len() != suppressions_before
+    }
+
+    fn may_run_language_servers(&self) -> bool {
+        !self.suppressed_servers.contains_key(&SuppressionKey {
+            worktree_id: None,
+            name: None,
+        })
     }
 
     /// Lifts every suppression covering `name` in `worktree_id` (in every worktree when `None`).
@@ -4738,6 +4817,10 @@ pub struct LspStore {
     lsp_data: HashMap<BufferId, BufferLspData>,
     buffer_reload_tasks: HashMap<BufferId, Task<anyhow::Result<()>>>,
     next_hint_id: Arc<AtomicUsize>,
+    window_active: bool,
+    last_active_at: Instant,
+    idle_suspension_delay: Option<Duration>,
+    idle_suspend_task: Option<Task<()>>,
 }
 
 #[derive(Debug)]
@@ -5075,6 +5158,9 @@ impl LspStore {
         cx.observe_global::<SettingsStore>(Self::on_settings_changed)
             .detach();
         let binary_status_task = subscribe_to_binary_statuses(&languages, cx);
+        let this = cx.weak_entity();
+        cx.default_global::<LspActivityCoordinator>()
+            .register(this, Instant::now());
 
         let _maintain_workspace_config = {
             let (sender, receiver) = watch::channel();
@@ -5148,6 +5234,10 @@ impl LspStore {
             active_entry: None,
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
+            window_active: true,
+            last_active_at: Instant::now(),
+            idle_suspension_delay: None,
+            idle_suspend_task: None,
         }
     }
 
@@ -5212,6 +5302,10 @@ impl LspStore {
 
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
+            window_active: true,
+            last_active_at: Instant::now(),
+            idle_suspension_delay: None,
+            idle_suspend_task: None,
         }
     }
 
@@ -6496,6 +6590,13 @@ impl LspStore {
 
     fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
         self.request_workspace_config_refresh();
+
+        let idle_suspension_delay = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .suspend_after_inactive();
+        if !self.window_active && idle_suspension_delay != self.idle_suspension_delay {
+            self.arm_idle_suspension(cx);
+        }
 
         let new_semantic_token_rules = crate::project_settings::ProjectSettings::get_global(cx)
             .global_lsp_settings
@@ -13178,6 +13279,108 @@ impl LspStore {
         // Shutting down removes the servers' tree nodes; rebuilding the tree keeps the
         // stopped servers listed as configured without starting them.
         self.refresh_server_tree(cx);
+    }
+
+    pub fn is_window_active(&self) -> bool {
+        self.window_active
+    }
+
+    /// Records whether a window showing this project is active. An inactive project suspends
+    /// its language servers once `suspend_after_inactive_minutes` have passed; an active one
+    /// resumes them and, within `max_active_projects`, suspends the least recently active
+    /// other projects.
+    pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.window_active = active;
+        if !active {
+            self.arm_idle_suspension(cx);
+            return;
+        }
+        self.idle_suspend_task = None;
+        self.last_active_at = Instant::now();
+        if self.as_local().is_none() {
+            return;
+        }
+        self.resume_language_servers(cx);
+        self.enforce_active_project_budget(cx);
+    }
+
+    fn arm_idle_suspension(&mut self, cx: &mut Context<Self>) {
+        let idle_suspension_delay = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .suspend_after_inactive()
+            .filter(|_| self.as_local().is_some());
+        self.idle_suspension_delay = idle_suspension_delay;
+        let Some(idle_suspension_delay) = idle_suspension_delay else {
+            self.idle_suspend_task = None;
+            return;
+        };
+        self.idle_suspend_task = Some(cx.spawn(async move |lsp_store, cx| {
+            cx.background_executor().timer(idle_suspension_delay).await;
+            lsp_store
+                .update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx))
+                .ok();
+        }));
+    }
+
+    /// Shuts every language server down while keeping them listed as configured, so that
+    /// they start again as soon as the project resumes.
+    pub fn suspend_language_servers(&mut self, cx: &mut Context<Self>) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        if !local.suspend_all_servers() {
+            return;
+        }
+        self.shutdown_all_language_servers(cx).detach();
+        // Shutting down removes the servers' tree nodes; rebuilding the tree keeps the
+        // suspended servers listed as configured without starting them.
+        self.refresh_server_tree(cx);
+    }
+
+    fn resume_language_servers(&mut self, cx: &mut Context<Self>) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        let resumed = local.clear_suppressions_with_reason(|reason| {
+            matches!(reason, SuppressionReason::Suspended { .. })
+        });
+        if resumed {
+            self.refresh_server_tree(cx);
+        }
+    }
+
+    fn enforce_active_project_budget(&mut self, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let other_projects = cx
+            .default_global::<LspActivityCoordinator>()
+            .record_activation(this, self.last_active_at);
+        let Some(max_active_projects) = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .max_active_projects()
+        else {
+            return;
+        };
+        let this_project_is_active = self
+            .as_local()
+            .is_some_and(|local| local.may_run_language_servers());
+        let other_active_projects = other_projects
+            .into_iter()
+            .filter_map(|lsp_store| lsp_store.upgrade())
+            .filter(|lsp_store| {
+                lsp_store
+                    .read(cx)
+                    .as_local()
+                    .is_some_and(|local| local.may_run_language_servers())
+            })
+            .collect::<Vec<_>>();
+        // The activating project always keeps its servers; the others give theirs up
+        // least recently active first.
+        let projects_over_budget = (other_active_projects.len()
+            + usize::from(this_project_is_active))
+        .saturating_sub(max_active_projects);
+        for lsp_store in other_active_projects.into_iter().take(projects_over_budget) {
+            lsp_store.update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx));
+        }
     }
 
     pub fn shutdown_all_language_servers(&mut self, cx: &mut Context<Self>) -> Task<()> {
