@@ -3353,7 +3353,7 @@ fn languages_and_tools_page(cx: &App) -> SettingsPage {
         ]
     }
 
-    fn diagnostics_section() -> [SettingsPageItem; 3] {
+    fn diagnostics_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Diagnostics"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -3367,6 +3367,25 @@ fn languages_and_tools_page(cx: &App) -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content.editor.diagnostics_max_severity = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Panel Max Severity",
+                description: "The most lenient severity shown in the project diagnostics panel and the buffer diagnostics view. Off is treated as error.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("diagnostics.max_severity"),
+                    pick: |settings_content| {
+                        settings_content.diagnostics.as_ref()?.max_severity.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .diagnostics
+                            .get_or_insert_default()
+                            .max_severity = value;
                     },
                 }),
                 metadata: None,
