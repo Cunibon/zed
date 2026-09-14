@@ -705,18 +705,23 @@ impl LanguageServerState {
                 &self.lsp_store,
             )
         });
-        let (status_color, status_label, message) = match &server.state {
-            ConfiguredServerState::Running(_) => (Color::Success, "Running", None),
-            ConfiguredServerState::Starting => (Color::Modified, "Starting…", None),
-            ConfiguredServerState::PendingTrust => (
-                Color::Warning,
-                "Waiting for the project to be trusted",
-                None,
-            ),
-            ConfiguredServerState::Stopped => (Color::Disabled, "Stopped", None),
-            ConfiguredServerState::Suspended { .. } => (Color::Disabled, "Suspended", None),
-            ConfiguredServerState::Failed(error) => (Color::Error, "Error", Some(error.clone())),
-        };
+        let (status_color, status_label, message): (Color, SharedString, Option<SharedString>) =
+            match &server.state {
+                ConfiguredServerState::Running(_) => (Color::Success, "Running".into(), None),
+                ConfiguredServerState::Starting => (Color::Modified, "Starting…".into(), None),
+                ConfiguredServerState::PendingTrust => (
+                    Color::Warning,
+                    "Waiting for the project to be trusted".into(),
+                    None,
+                ),
+                ConfiguredServerState::Stopped => (Color::Disabled, "Stopped".into(), None),
+                ConfiguredServerState::Suspended { since } => {
+                    (Color::Disabled, suspended_status_label(*since), None)
+                }
+                ConfiguredServerState::Failed(error) => {
+                    (Color::Error, "Error".into(), Some(error.clone()))
+                }
+            };
         let start_label = match &server.state {
             ConfiguredServerState::Running(_)
             | ConfiguredServerState::Starting
@@ -804,6 +809,7 @@ impl LanguageServerState {
                 }
 
                 let message = message.clone();
+                let status_label = status_label.clone();
                 submenu.separator().custom_row(move |_, _| {
                     v_flex()
                         .id("metadata-container")
@@ -819,7 +825,7 @@ impl LanguageServerState {
                                         .size(IconSize::Small),
                                 )
                                 .child(
-                                    Label::new(status_label)
+                                    Label::new(status_label.clone())
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 ),
@@ -1701,10 +1707,33 @@ impl Render for LspButton {
     }
 }
 
+fn suspended_status_label(since: Instant) -> SharedString {
+    let idle_minutes = since.elapsed().as_secs() / 60;
+    if idle_minutes == 0 {
+        "Suspended (idle for less than a minute)".into()
+    } else {
+        format!("Suspended (idle {idle_minutes} min)").into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use language::LanguageName;
+
+    #[test]
+    fn suspended_status_label_reports_idle_minutes() {
+        let now = Instant::now();
+        assert_eq!(
+            &*suspended_status_label(now),
+            "Suspended (idle for less than a minute)"
+        );
+        let twelve_minutes_ago = now.checked_sub(Duration::from_secs(12 * 60 + 30)).unwrap();
+        assert_eq!(
+            &*suspended_status_label(twelve_minutes_ago),
+            "Suspended (idle 12 min)"
+        );
+    }
 
     fn server_id(n: usize) -> LanguageServerId {
         LanguageServerId(n)
