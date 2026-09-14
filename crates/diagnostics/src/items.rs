@@ -6,13 +6,15 @@ use gpui::{
     Task, WeakEntity, Window,
 };
 use language::Diagnostic;
-use project::project_settings::{GoToDiagnosticSeverityFilter, ProjectSettings};
+use project::project_settings::{
+    DiagnosticSeverity, GoToDiagnosticSeverityFilter, ProjectSettings,
+};
 use settings::Settings;
 use ui::{Button, ButtonLike, Color, Icon, IconName, Label, Tooltip, h_flex, prelude::*};
 use util::ResultExt;
 use workspace::{HideStatusItem, StatusItemView, ToolbarItemEvent, Workspace, item::ItemHandle};
 
-use crate::{Deploy, IncludeWarnings, ProjectDiagnosticsEditor};
+use crate::{Deploy, PanelMaxSeverity, ProjectDiagnosticsEditor, initial_max_severity};
 
 /// The status bar item that displays diagnostic counts.
 pub struct DiagnosticIndicator {
@@ -122,10 +124,11 @@ impl Render for DiagnosticIndicator {
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(workspace) = this.workspace.upgrade() {
-                            if this.summary.error_count == 0 && this.summary.warning_count > 0 {
-                                cx.update_default_global(
-                                    |show_warnings: &mut IncludeWarnings, _| show_warnings.0 = true,
-                                );
+                            if this.summary.error_count == 0
+                                && this.summary.warning_count > 0
+                                && initial_max_severity(cx) < DiagnosticSeverity::Warning
+                            {
+                                cx.set_global(PanelMaxSeverity(DiagnosticSeverity::Warning));
                             }
                             workspace.update(cx, |workspace, cx| {
                                 ProjectDiagnosticsEditor::deploy(

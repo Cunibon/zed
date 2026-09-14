@@ -20,7 +20,7 @@ use project::{
 };
 use rand::{Rng, rngs::StdRng, seq::IteratorRandom as _};
 use serde_json::json;
-use settings::SettingsStore;
+use settings::{DiagnosticSeverityContent, SettingsStore};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -121,7 +121,13 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
 
     // Open the project diagnostics view while there are already diagnostics.
     let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
@@ -362,7 +368,13 @@ async fn test_diagnostics_with_folds(cx: &mut TestAppContext) {
         .unwrap();
 
     let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
@@ -472,7 +484,13 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
         .unwrap();
 
     let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
@@ -684,7 +702,13 @@ async fn test_random_diagnostics_blocks(cx: &mut TestAppContext, mut rng: StdRng
         .unwrap();
 
     let mutated_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
 
     workspace.update_in(cx, |workspace, window, cx| {
@@ -794,7 +818,13 @@ async fn test_random_diagnostics_blocks(cx: &mut TestAppContext, mut rng: StdRng
 
     log::info!("constructing reference diagnostics view");
     let reference_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
     cx.executor()
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
@@ -859,7 +889,13 @@ async fn test_random_diagnostics_with_inlays(cx: &mut TestAppContext, mut rng: S
         .unwrap();
 
     let mutated_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
 
     workspace.update_in(cx, |workspace, window, cx| {
@@ -1542,7 +1578,13 @@ async fn test_diagnostics_views_update_when_only_markdown_changes(cx: &mut TestA
         .unwrap();
 
     let project_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
     let project_editor =
         project_diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
@@ -1551,7 +1593,7 @@ async fn test_diagnostics_views_update_when_only_markdown_changes(cx: &mut TestA
             project_path,
             project.clone(),
             Some(buffer),
-            true,
+            DiagnosticSeverity::Warning,
             window,
             cx,
         )
@@ -1782,7 +1824,13 @@ async fn test_diagnostics_with_code(cx: &mut TestAppContext) {
 
     // Open the project diagnostics view
     let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(true, project.clone(), workspace.downgrade(), window, cx)
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Warning,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
     });
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
@@ -1930,6 +1978,203 @@ async fn go_to_diagnostic_with_severity(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/test"),
+        json!({
+            "main.rs": "
+                fn main() {
+                    error();
+                    warning();
+                    info();
+                    hint();
+                }
+            "
+            .unindent(),
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store
+            .update_diagnostics(
+                LanguageServerId(0),
+                lsp::PublishDiagnosticsParams {
+                    uri: lsp::Uri::from_file_path(path!("/test/main.rs")).unwrap(),
+                    version: None,
+                    diagnostics: vec![
+                        lsp::Diagnostic {
+                            range: lsp::Range::new(
+                                lsp::Position::new(1, 4),
+                                lsp::Position::new(1, 9),
+                            ),
+                            severity: Some(lsp::DiagnosticSeverity::ERROR),
+                            message: lsp::DiagnosticMessage::from("an error"),
+                            ..Default::default()
+                        },
+                        lsp::Diagnostic {
+                            range: lsp::Range::new(
+                                lsp::Position::new(2, 4),
+                                lsp::Position::new(2, 11),
+                            ),
+                            severity: Some(lsp::DiagnosticSeverity::WARNING),
+                            message: lsp::DiagnosticMessage::from("a warning"),
+                            ..Default::default()
+                        },
+                        lsp::Diagnostic {
+                            range: lsp::Range::new(
+                                lsp::Position::new(3, 4),
+                                lsp::Position::new(3, 8),
+                            ),
+                            severity: Some(lsp::DiagnosticSeverity::INFORMATION),
+                            message: lsp::DiagnosticMessage::from("some info"),
+                            ..Default::default()
+                        },
+                        lsp::Diagnostic {
+                            range: lsp::Range::new(
+                                lsp::Position::new(4, 4),
+                                lsp::Position::new(4, 8),
+                            ),
+                            severity: Some(lsp::DiagnosticSeverity::HINT),
+                            message: lsp::DiagnosticMessage::from("a hint"),
+                            ..Default::default()
+                        },
+                    ],
+                },
+                None,
+                DiagnosticSourceKind::Pushed,
+                &[],
+                cx,
+            )
+            .unwrap();
+    });
+
+    let diagnostics = window.build_entity(cx, |window, cx| {
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Error,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
+    });
+    let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
+    diagnostics
+        .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
+        .await;
+
+    let errors_only = indoc::indoc! {
+        "§ main.rs
+         § -----
+         fn main() {
+             error(); § an error
+             warning();
+             info();"
+    };
+    let errors_and_warnings = indoc::indoc! {
+        "§ main.rs
+         § -----
+         fn main() {
+             error(); § an error
+             warning(); § a warning
+             info();
+             hint();"
+    };
+    let errors_warnings_and_info = indoc::indoc! {
+        "§ main.rs
+         § -----
+         fn main() {
+             error(); § an error
+             warning(); § a warning
+             info(); § some info
+             hint();
+         }"
+    };
+    let everything = indoc::indoc! {
+        "§ main.rs
+         § -----
+         fn main() {
+             error(); § an error
+             warning(); § a warning
+             info(); § some info
+             hint(); § a hint
+         }"
+    };
+
+    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
+        DiagnosticSeverity::Error
+    );
+
+    // Changing the setting while the panel is open lowers its threshold.
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.diagnostics.get_or_insert_default().max_severity =
+                    Some(DiagnosticSeverityContent::Info);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        errors_warnings_and_info
+    );
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
+        DiagnosticSeverity::Info
+    );
+
+    // ToggleWarnings hides warnings while they are shown, and shows them otherwise.
+    diagnostics.update_in(cx, |diagnostics, window, cx| {
+        diagnostics.toggle_warnings(&ToggleWarnings, window, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
+
+    diagnostics.update_in(cx, |diagnostics, window, cx| {
+        diagnostics.toggle_warnings(&ToggleWarnings, window, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_and_warnings);
+
+    // Any level can be selected directly.
+    diagnostics.update(cx, |diagnostics, cx| {
+        diagnostics.set_max_severity(DiagnosticSeverity::Hint, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), everything);
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
+        DiagnosticSeverity::Hint
+    );
+}
+
+#[gpui::test]
 async fn test_buffer_diagnostics(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -2059,7 +2304,7 @@ async fn test_buffer_diagnostics(cx: &mut TestAppContext) {
             project_path.clone(),
             project.clone(),
             buffer,
-            true,
+            DiagnosticSeverity::Warning,
             window,
             cx,
         )
@@ -2102,7 +2347,7 @@ async fn test_buffer_diagnostics(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_buffer_diagnostics_without_warnings(cx: &mut TestAppContext) {
+async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -2183,19 +2428,30 @@ async fn test_buffer_diagnostics_without_warnings(cx: &mut TestAppContext) {
                         },
                     ]),
                     ..Default::default()
+                },
+                lsp::Diagnostic{
+                    range: lsp::Range::new(lsp::Position::new(0, 3), lsp::Position::new(0, 7)),
+                    severity: Some(lsp::DiagnosticSeverity::INFORMATION),
+                    message: lsp::DiagnosticMessage::from("some info"),
+                    ..Default::default()
+                },
+                lsp::Diagnostic{
+                    range: lsp::Range::new(lsp::Position::new(7, 0), lsp::Position::new(7, 1)),
+                    severity: Some(lsp::DiagnosticSeverity::HINT),
+                    message: lsp::DiagnosticMessage::from("a hint"),
+                    ..Default::default()
                 }
             ],
             version: None
         }, None, DiagnosticSourceKind::Pushed, &[], cx).unwrap();
     });
 
-    let include_warnings = false;
     let buffer_diagnostics = window.build_entity(cx, |window, cx| {
         BufferDiagnosticsEditor::new(
             project_path.clone(),
             project.clone(),
             buffer,
-            include_warnings,
+            DiagnosticSeverity::Error,
             window,
             cx,
         )
@@ -2230,6 +2486,109 @@ async fn test_buffer_diagnostics_without_warnings(cx: &mut TestAppContext) {
              § hint: move occurs because `x` has type `Vec<char>`, which does not
              § implement the `Copy` trait
              }"
+        }
+    );
+
+    // Warnings join the errors once the threshold is lowered.
+    buffer_diagnostics.update(cx, |buffer_diagnostics, cx| {
+        buffer_diagnostics.set_max_severity(DiagnosticSeverity::Warning, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        indoc::indoc! {
+            "§ main.rs
+             § -----
+             fn main() {
+                 let x = vec![];
+             § move occurs because `x` has type `Vec<char>`, which does not implement
+             § the `Copy` trait (back)
+                 let y = vec![];
+             § move occurs because `y` has type `Vec<char>`, which does not implement
+             § the `Copy` trait
+                 a(x); § value moved here
+                 b(y); § value moved here
+                 c(y);
+             § use of moved value
+             § value used here after move
+                 d(x);
+             § use of moved value
+             § value used here after move
+             § hint: move occurs because `x` has type `Vec<char>`, which does not
+             § implement the `Copy` trait
+             }"
+        }
+    );
+
+    buffer_diagnostics.update(cx, |buffer_diagnostics, cx| {
+        buffer_diagnostics.set_max_severity(DiagnosticSeverity::Info, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        indoc::indoc! {
+            "§ main.rs
+             § -----
+             fn main() { § some info
+                 let x = vec![];
+             § move occurs because `x` has type `Vec<char>`, which does not implement
+             § the `Copy` trait (back)
+                 let y = vec![];
+             § move occurs because `y` has type `Vec<char>`, which does not implement
+             § the `Copy` trait
+                 a(x); § value moved here
+                 b(y); § value moved here
+                 c(y);
+             § use of moved value
+             § value used here after move
+                 d(x);
+             § use of moved value
+             § value used here after move
+             § hint: move occurs because `x` has type `Vec<char>`, which does not
+             § implement the `Copy` trait
+             }"
+        }
+    );
+
+    buffer_diagnostics.update(cx, |buffer_diagnostics, cx| {
+        buffer_diagnostics.set_max_severity(DiagnosticSeverity::Hint, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        indoc::indoc! {
+            "§ main.rs
+             § -----
+             fn main() { § some info
+                 let x = vec![];
+             § move occurs because `x` has type `Vec<char>`, which does not implement
+             § the `Copy` trait (back)
+                 let y = vec![];
+             § move occurs because `y` has type `Vec<char>`, which does not implement
+             § the `Copy` trait
+                 a(x); § value moved here
+                 b(y); § value moved here
+                 c(y);
+             § use of moved value
+             § value used here after move
+                 d(x);
+             § use of moved value
+             § value used here after move
+             § hint: move occurs because `x` has type `Vec<char>`, which does not
+             § implement the `Copy` trait
+             } § a hint"
         }
     );
 }
@@ -2334,7 +2693,7 @@ async fn test_buffer_diagnostics_multiple_servers(cx: &mut TestAppContext) {
             project_path.clone(),
             project.clone(),
             buffer,
-            true,
+            DiagnosticSeverity::Warning,
             window,
             cx,
         )

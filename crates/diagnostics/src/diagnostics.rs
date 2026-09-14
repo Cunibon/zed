@@ -30,7 +30,7 @@ use project::{
     DiagnosticSummary, Project, ProjectPath,
     project_settings::{DiagnosticSeverity, ProjectSettings},
 };
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
     cmp,
@@ -62,9 +62,26 @@ actions!(
     ]
 );
 
-#[derive(Default)]
-pub(crate) struct IncludeWarnings(bool);
-impl Global for IncludeWarnings {}
+/// Shared by every open diagnostics view so that changing the threshold in
+/// one view changes it in all of them.
+#[derive(Clone, Copy)]
+pub(crate) struct PanelMaxSeverity(pub(crate) DiagnosticSeverity);
+impl Global for PanelMaxSeverity {}
+
+pub(crate) fn initial_max_severity(cx: &App) -> DiagnosticSeverity {
+    match cx.try_global::<PanelMaxSeverity>() {
+        Some(max_severity) => max_severity.0,
+        None => ProjectSettings::get_global(cx).diagnostics.max_severity,
+    }
+}
+
+pub(crate) fn toggled_warnings_severity(max_severity: DiagnosticSeverity) -> DiagnosticSeverity {
+    if max_severity >= DiagnosticSeverity::Warning {
+        DiagnosticSeverity::Error
+    } else {
+        DiagnosticSeverity::Warning
+    }
+}
 
 pub fn init(cx: &mut App) {
     editor::set_diagnostic_renderer(diagnostic_renderer::DiagnosticRenderer {}, cx);
@@ -82,7 +99,8 @@ pub(crate) struct ProjectDiagnosticsEditor {
     summary: DiagnosticSummary,
     multibuffer: Entity<MultiBuffer>,
     paths_to_update: BTreeSet<ProjectPath>,
-    include_warnings: bool,
+    max_severity: DiagnosticSeverity,
+    settings_max_severity: DiagnosticSeverity,
     update_excerpts_task: Option<Task<Result<()>>>,
     diagnostic_summary_update: Task<()>,
     _subscription: Subscription,
@@ -95,7 +113,7 @@ const DIAGNOSTICS_SUMMARY_UPDATE_DEBOUNCE: Duration = Duration::from_millis(30);
 
 impl Render for ProjectDiagnosticsEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let warning_count = if self.include_warnings {
+        let warning_count = if self.max_severity >= DiagnosticSeverity::Warning {
             self.summary.warning_count
         } else {
             0
@@ -166,7 +184,7 @@ impl ProjectDiagnosticsEditor {
     }
 
     fn new(
-        include_warnings: bool,
+        max_severity: DiagnosticSeverity,
         project_handle: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -224,14 +242,7 @@ impl ProjectDiagnosticsEditor {
                 Editor::for_multibuffer(excerpts.clone(), Some(project_handle.clone()), window, cx);
             editor.set_vertical_scroll_margin(5, cx);
             editor.disable_inline_diagnostics();
-            editor.set_max_diagnostics_severity(
-                if include_warnings {
-                    DiagnosticSeverity::Warning
-                } else {
-                    DiagnosticSeverity::Error
-                },
-                cx,
-            );
+            editor.set_max_diagnostics_severity(max_severity, cx);
             editor.set_all_diagnostics_active(cx);
             editor
         });
@@ -256,20 +267,24 @@ impl ProjectDiagnosticsEditor {
             },
         )
         .detach();
-        cx.observe_global_in::<IncludeWarnings>(window, |this, window, cx| {
-            let include_warnings = cx.global::<IncludeWarnings>().0;
-            this.include_warnings = include_warnings;
+        cx.observe_global_in::<PanelMaxSeverity>(window, |this, window, cx| {
+            let max_severity = cx.global::<PanelMaxSeverity>().0;
+            if max_severity == this.max_severity {
+                return;
+            }
+            this.max_severity = max_severity;
             this.editor.update(cx, |editor, cx| {
-                editor.set_max_diagnostics_severity(
-                    if include_warnings {
-                        DiagnosticSeverity::Warning
-                    } else {
-                        DiagnosticSeverity::Error
-                    },
-                    cx,
-                )
+                editor.set_max_diagnostics_severity(max_severity, cx)
             });
             this.refresh(window, cx);
+        })
+        .detach();
+        cx.observe_global::<SettingsStore>(|this, cx| {
+            let max_severity = ProjectSettings::get_global(cx).diagnostics.max_severity;
+            if max_severity != this.settings_max_severity {
+                this.settings_max_severity = max_severity;
+                cx.set_global(PanelMaxSeverity(max_severity));
+            }
         })
         .detach();
 
@@ -279,7 +294,8 @@ impl ProjectDiagnosticsEditor {
             summary: project.diagnostic_summary(false, cx),
             diagnostics: Default::default(),
             blocks: Default::default(),
-            include_warnings,
+            max_severity,
+            settings_max_severity: ProjectSettings::get_global(cx).diagnostics.max_severity,
             workspace,
             multibuffer: excerpts,
             focus_handle,
@@ -398,14 +414,11 @@ impl ProjectDiagnosticsEditor {
         } else {
             let workspace_handle = cx.entity().downgrade();
 
-            let include_warnings = match cx.try_global::<IncludeWarnings>() {
-                Some(include_warnings) => include_warnings.0,
-                None => ProjectSettings::get_global(cx).diagnostics.include_warnings,
-            };
+            let max_severity = initial_max_severity(cx);
 
             let diagnostics = cx.new(|cx| {
                 ProjectDiagnosticsEditor::new(
-                    include_warnings,
+                    max_severity,
                     workspace.project().clone(),
                     workspace_handle,
                     window,
@@ -417,7 +430,15 @@ impl ProjectDiagnosticsEditor {
     }
 
     fn toggle_warnings(&mut self, _: &ToggleWarnings, _: &mut Window, cx: &mut Context<Self>) {
-        cx.set_global(IncludeWarnings(!self.include_warnings));
+        self.set_max_severity(toggled_warnings_severity(self.max_severity), cx);
+    }
+
+    pub(crate) fn set_max_severity(
+        &mut self,
+        max_severity: DiagnosticSeverity,
+        cx: &mut Context<Self>,
+    ) {
+        cx.set_global(PanelMaxSeverity(max_severity));
     }
 
     fn toggle_diagnostics_refresh(
@@ -499,11 +520,10 @@ impl ProjectDiagnosticsEditor {
         let buffer_snapshot = buffer.read(cx).snapshot();
         let buffer_id = buffer_snapshot.remote_id();
 
-        let max_severity = if self.include_warnings {
-            lsp::DiagnosticSeverity::WARNING
-        } else {
-            lsp::DiagnosticSeverity::ERROR
-        };
+        let max_severity = self
+            .max_severity
+            .into_lsp()
+            .unwrap_or(lsp::DiagnosticSeverity::ERROR);
 
         cx.spawn_in(window, async move |this, cx| {
             let diagnostics = buffer_snapshot
@@ -840,7 +860,7 @@ impl Item for ProjectDiagnosticsEditor {
     {
         Task::ready(Some(cx.new(|cx| {
             ProjectDiagnosticsEditor::new(
-                self.include_warnings,
+                self.max_severity,
                 self.project.clone(),
                 self.workspace.clone(),
                 window,
@@ -926,11 +946,11 @@ impl Item for ProjectDiagnosticsEditor {
 }
 
 impl DiagnosticsToolbarEditor for WeakEntity<ProjectDiagnosticsEditor> {
-    fn include_warnings(&self, cx: &App) -> bool {
+    fn max_severity(&self, cx: &App) -> DiagnosticSeverity {
         self.read_with(cx, |project_diagnostics_editor, _cx| {
-            project_diagnostics_editor.include_warnings
+            project_diagnostics_editor.max_severity
         })
-        .unwrap_or(false)
+        .unwrap_or(DiagnosticSeverity::Warning)
     }
 
     fn is_updating(&self, cx: &App) -> bool {
@@ -959,10 +979,11 @@ impl DiagnosticsToolbarEditor for WeakEntity<ProjectDiagnosticsEditor> {
         });
     }
 
-    fn toggle_warnings(&self, window: &mut Window, cx: &mut App) {
-        let _ = self.update(cx, |project_diagnostics_editor, cx| {
-            project_diagnostics_editor.toggle_warnings(&Default::default(), window, cx);
-        });
+    fn set_max_severity(&self, max_severity: DiagnosticSeverity, cx: &mut App) {
+        self.update(cx, |project_diagnostics_editor, cx| {
+            project_diagnostics_editor.set_max_severity(max_severity, cx);
+        })
+        .log_err();
     }
 
     fn get_diagnostics_for_buffer(
