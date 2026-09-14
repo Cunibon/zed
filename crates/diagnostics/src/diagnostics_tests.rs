@@ -2306,6 +2306,52 @@ fn four_severity_diagnostics() -> Vec<lsp::Diagnostic> {
 }
 
 #[test]
+fn empty_state_copy_names_the_threshold() {
+    assert_eq!(no_diagnostics_label(DiagnosticSeverity::Error), "No errors");
+    assert_eq!(
+        no_diagnostics_label(DiagnosticSeverity::Warning),
+        "No errors or warnings"
+    );
+    assert_eq!(
+        no_diagnostics_label(DiagnosticSeverity::Info),
+        "No errors, warnings, or info diagnostics"
+    );
+    assert_eq!(
+        no_diagnostics_label(DiagnosticSeverity::Hint),
+        "No diagnostics"
+    );
+}
+
+#[test]
+fn empty_state_offers_the_next_more_lenient_level() {
+    assert_eq!(
+        show_more_button(DiagnosticSeverity::Error, 0),
+        Some(("Show warnings".to_string(), DiagnosticSeverity::Warning))
+    );
+    assert_eq!(
+        show_more_button(DiagnosticSeverity::Error, 1),
+        Some(("Show 1 warning".to_string(), DiagnosticSeverity::Warning))
+    );
+    assert_eq!(
+        show_more_button(DiagnosticSeverity::Error, 3),
+        Some(("Show 3 warnings".to_string(), DiagnosticSeverity::Warning))
+    );
+    // Only errors and warnings are counted, so lower levels get no number.
+    assert_eq!(
+        show_more_button(DiagnosticSeverity::Warning, 3),
+        Some((
+            "Show info diagnostics".to_string(),
+            DiagnosticSeverity::Info
+        ))
+    );
+    assert_eq!(
+        show_more_button(DiagnosticSeverity::Info, 0),
+        Some(("Show hints".to_string(), DiagnosticSeverity::Hint))
+    );
+    assert_eq!(show_more_button(DiagnosticSeverity::Hint, 0), None);
+}
+
+#[test]
 fn panel_max_severity_never_hides_everything() {
     assert_eq!(
         panel_max_severity(DiagnosticSeverityContent::Off),

@@ -95,6 +95,39 @@ pub(crate) fn initial_max_severity(cx: &App) -> DiagnosticSeverity {
     }
 }
 
+pub(crate) fn no_diagnostics_label(max_severity: DiagnosticSeverity) -> &'static str {
+    match max_severity {
+        DiagnosticSeverity::Off | DiagnosticSeverity::Error => "No errors",
+        DiagnosticSeverity::Warning => "No errors or warnings",
+        DiagnosticSeverity::Info => "No errors, warnings, or info diagnostics",
+        DiagnosticSeverity::Hint => "No diagnostics",
+    }
+}
+
+/// Offers the next more lenient level. `DiagnosticSummary` only counts errors
+/// and warnings, so a number is shown solely when that next level is warnings.
+pub(crate) fn show_more_button(
+    max_severity: DiagnosticSeverity,
+    warning_count: usize,
+) -> Option<(String, DiagnosticSeverity)> {
+    match max_severity {
+        DiagnosticSeverity::Off | DiagnosticSeverity::Error => {
+            let label = match warning_count {
+                0 => "Show warnings".to_string(),
+                1 => "Show 1 warning".to_string(),
+                count => format!("Show {count} warnings"),
+            };
+            Some((label, DiagnosticSeverity::Warning))
+        }
+        DiagnosticSeverity::Warning => Some((
+            "Show info diagnostics".to_string(),
+            DiagnosticSeverity::Info,
+        )),
+        DiagnosticSeverity::Info => Some(("Show hints".to_string(), DiagnosticSeverity::Hint)),
+        DiagnosticSeverity::Hint => None,
+    }
+}
+
 pub(crate) fn toggled_warnings_severity(max_severity: DiagnosticSeverity) -> DiagnosticSeverity {
     if max_severity >= DiagnosticSeverity::Warning {
         DiagnosticSeverity::Error
@@ -141,11 +174,7 @@ impl Render for ProjectDiagnosticsEditor {
 
         let child =
             if warning_count + self.summary.error_count == 0 && self.editor.read(cx).is_empty(cx) {
-                let label = if self.summary.warning_count == 0 {
-                    SharedString::new_static("No problems in workspace")
-                } else {
-                    SharedString::new_static("No errors in workspace")
-                };
+                let label = format!("{} in workspace", no_diagnostics_label(self.max_severity));
                 v_flex()
                     .key_context("EmptyPane")
                     .size_full()
@@ -155,25 +184,17 @@ impl Render for ProjectDiagnosticsEditor {
                     .text_center()
                     .bg(cx.theme().colors().editor_background)
                     .child(Label::new(label).color(Color::Muted))
-                    .when(self.summary.warning_count > 0, |this| {
-                        let plural_suffix = if self.summary.warning_count > 1 {
-                            "s"
-                        } else {
-                            ""
-                        };
-                        let label = format!(
-                            "Show {} warning{}",
-                            self.summary.warning_count, plural_suffix
-                        );
-                        this.child(
-                            Button::new("diagnostics-show-warning-label", label).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.toggle_warnings(&Default::default(), window, cx);
+                    .when_some(
+                        show_more_button(self.max_severity, self.summary.warning_count),
+                        |this, (label, next_severity)| {
+                            this.child(Button::new("diagnostics-show-more", label).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.set_max_severity(next_severity, cx);
                                     cx.notify();
                                 }),
-                            ),
-                        )
-                    })
+                            ))
+                        },
+                    )
             } else {
                 div().size_full().child(self.editor.clone())
             };

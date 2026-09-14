@@ -2,7 +2,8 @@ use crate::{
     DIAGNOSTICS_UPDATE_DEBOUNCE, PanelMaxSeverity, SetMaxSeverity, ToggleWarnings,
     context_range_for_entry,
     diagnostic_renderer::{DiagnosticBlock, DiagnosticRenderer},
-    initial_max_severity, panel_max_severity, toggled_warnings_severity,
+    initial_max_severity, no_diagnostics_label, panel_max_severity, show_more_button,
+    toggled_warnings_severity,
     toolbar_controls::DiagnosticsToolbarEditor,
 };
 use anyhow::Result;
@@ -938,10 +939,7 @@ impl Render for BufferDiagnosticsEditor {
         };
 
         let child = if error_count + warning_count == 0 && self.editor.read(cx).is_empty(cx) {
-            let label = match warning_count {
-                0 => "No problems in",
-                _ => "No errors in",
-            };
+            let label = format!("{} in", no_diagnostics_label(self.max_severity));
 
             v_flex()
                 .key_context("EmptyPane")
@@ -976,25 +974,17 @@ impl Render for BufferDiagnosticsEditor {
                                 })),
                         ),
                 )
-                .when(self.summary.warning_count > 0, |div| {
-                    let label = match self.summary.warning_count {
-                        1 => "Show 1 warning".into(),
-                        warning_count => format!("Show {} warnings", warning_count),
-                    };
-
-                    div.child(
-                        Button::new("diagnostics-show-warning-label", label).on_click(cx.listener(
-                            |buffer_diagnostics_editor, _, window, cx| {
-                                buffer_diagnostics_editor.toggle_warnings(
-                                    &Default::default(),
-                                    window,
-                                    cx,
-                                );
+                .when_some(
+                    show_more_button(self.max_severity, self.summary.warning_count),
+                    |div, (label, next_severity)| {
+                        div.child(Button::new("diagnostics-show-more", label).on_click(
+                            cx.listener(move |buffer_diagnostics_editor, _, _, cx| {
+                                buffer_diagnostics_editor.set_max_severity(next_severity, cx);
                                 cx.notify();
-                            },
-                        )),
-                    )
-                })
+                            }),
+                        ))
+                    },
+                )
         } else {
             div().size_full().child(self.editor.clone())
         };
