@@ -46,6 +46,30 @@ This is disabled by default, but can either be temporarily turned on (or off) us
 }
 ```
 
+# Diagnostics panel
+
+The project diagnostics panel (`diagnostics::Deploy`) and the buffer diagnostics view (`diagnostics::DeployCurrentFile`) list every diagnostic up to a severity threshold.
+By default only errors and warnings are shown; lower the threshold to also see the info and hint diagnostics that language servers report:
+
+```json [settings]
+"diagnostics": {
+  "max_severity": "warning" // "error", "warning", "info", "hint" or "all"
+}
+```
+
+The threshold can also be changed for the current session, without editing settings, from the severity menu in the panel toolbar, with `diagnostics::ToggleWarnings`, or by binding `diagnostics::SetMaxSeverity` to a key:
+
+```json [keymap]
+{
+  "context": "Diagnostics",
+  "bindings": {
+    "alt-i": ["diagnostics::SetMaxSeverity", { "severity": "info" }]
+  }
+}
+```
+
+The status bar only counts errors and warnings, so files that contain nothing but info or hint diagnostics do not add to its counters even though they appear in the panel.
+
 # Other UI places
 
 ## Project Panel
