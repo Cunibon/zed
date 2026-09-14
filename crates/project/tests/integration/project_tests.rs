@@ -4050,6 +4050,157 @@ async fn test_starting_one_server_after_stop_all_keeps_others_stopped(
 }
 
 #[gpui::test]
+async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::{ConfiguredLanguageServer, ConfiguredServerState};
+
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.js": "" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    // An adapter without a fake server cannot resolve a binary, so it fails to start.
+    language_registry.register_fake_lsp_adapter(
+        "JavaScript",
+        FakeLspAdapter {
+            name: "broken-js-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+    language_registry.add(js_lang());
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+
+    let tree_changes = std::rc::Rc::new(std::cell::Cell::new(0));
+    cx.update({
+        let tree_changes = tree_changes.clone();
+        |cx| {
+            cx.subscribe(&lsp_store, move |_, event, _| {
+                if matches!(event, LspStoreEvent::ConfiguredLanguageServersChanged) {
+                    tree_changes.set(tree_changes.get() + 1);
+                }
+            })
+        }
+    })
+    .detach();
+
+    let _rs_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_1 = fake_rust_servers.next().await.unwrap();
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    cx.executor().run_until_parked();
+    assert_eq!(
+        lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers()),
+        vec![ConfiguredLanguageServer {
+            name: LanguageServerName::new_static("rust-lsp"),
+            worktree_id,
+            languages: vec![LanguageName::new("Rust")],
+            state: ConfiguredServerState::Running(fake_rust_server_1.server.server_id()),
+        }]
+    );
+
+    let _js_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.js"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    let configured =
+        lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers());
+    assert_eq!(configured.len(), 2, "{configured:?}");
+    assert_eq!(
+        configured[0].name,
+        LanguageServerName::new_static("broken-js-lsp")
+    );
+    assert_eq!(
+        configured[0].languages,
+        vec![LanguageName::new("JavaScript")]
+    );
+    match &configured[0].state {
+        ConfiguredServerState::Failed(error) => {
+            assert!(error.contains("disabled in tests"), "{error}")
+        }
+        other => panic!("expected the js server to have failed, got {other:?}"),
+    }
+    assert_eq!(
+        configured[1].state,
+        ConfiguredServerState::Running(fake_rust_server_1.server.server_id())
+    );
+
+    let tree_changes_before_stop = tree_changes.get();
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+    cx.executor().run_until_parked();
+    assert!(
+        tree_changes.get() > tree_changes_before_stop,
+        "stopping must announce the configured servers change"
+    );
+    let configured =
+        lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers());
+    assert_eq!(
+        configured
+            .iter()
+            .map(|server| (server.name.clone(), server.state.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                LanguageServerName::new_static("broken-js-lsp"),
+                ConfiguredServerState::Stopped
+            ),
+            (
+                LanguageServerName::new_static("rust-lsp"),
+                ConfiguredServerState::Stopped
+            ),
+        ]
+    );
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.restart_all_language_servers(cx);
+    });
+    let mut fake_rust_server_2 = fake_rust_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("restart all should start the stopped rust server")
+        .unwrap();
+    fake_rust_server_2
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    cx.executor().run_until_parked();
+    let configured =
+        lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers());
+    assert_eq!(
+        configured[1].state,
+        ConfiguredServerState::Running(fake_rust_server_2.server.server_id())
+    );
+    assert_matches!(configured[0].state, ConfiguredServerState::Failed(_));
+}
+
+#[gpui::test]
 async fn test_updating_lsp_settings_sends_one_did_change_configuration(
     cx: &mut gpui::TestAppContext,
 ) {
