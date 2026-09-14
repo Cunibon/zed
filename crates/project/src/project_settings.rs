@@ -624,11 +624,37 @@ pub struct DiagnosticsSettings {
     /// Whether or not to include warning diagnostics.
     pub include_warnings: bool,
 
+    /// The most lenient severity shown in the project and buffer diagnostics
+    /// views. Never `Off`.
+    pub max_severity: DiagnosticSeverity,
+
     /// Settings for using LSP pull diagnostics mechanism in Zed.
     pub lsp_pull_diagnostics: LspPullDiagnosticsSettings,
 
     /// Settings for showing inline diagnostics.
     pub inline: InlineDiagnosticsSettings,
+}
+
+/// `include_warnings` predates `max_severity`, so `false` is still honoured, but
+/// only while `max_severity` sits at its default of `Warning`: once settings are
+/// merged an explicit `"warning"` cannot be told apart from the default, and a
+/// user who lowered the threshold further has clearly moved to the new key.
+fn resolve_panel_max_severity(
+    max_severity: Option<settings::DiagnosticSeverityContent>,
+    include_warnings: bool,
+) -> DiagnosticSeverity {
+    match max_severity.map(DiagnosticSeverity::from) {
+        None => {
+            if include_warnings {
+                DiagnosticSeverity::Warning
+            } else {
+                DiagnosticSeverity::Error
+            }
+        }
+        Some(DiagnosticSeverity::Off) => DiagnosticSeverity::Error,
+        Some(DiagnosticSeverity::Warning) if !include_warnings => DiagnosticSeverity::Error,
+        Some(max_severity) => max_severity,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,6 +807,10 @@ impl Settings for ProjectSettings {
             diagnostics: DiagnosticsSettings {
                 button: diagnostics.button.unwrap(),
                 include_warnings: diagnostics.include_warnings.unwrap(),
+                max_severity: resolve_panel_max_severity(
+                    diagnostics.max_severity,
+                    diagnostics.include_warnings.unwrap(),
+                ),
                 lsp_pull_diagnostics: LspPullDiagnosticsSettings {
                     enabled: lsp_pull_diagnostics.enabled.unwrap(),
                     debounce_ms: lsp_pull_diagnostics.debounce_ms.unwrap().0,
@@ -1630,4 +1660,62 @@ impl From<DapSettingsContent> for DapSettings {
 pub enum DapBinary {
     Default,
     Custom(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use settings::DiagnosticSeverityContent;
+
+    #[test]
+    fn panel_max_severity_uses_the_new_key_when_set_below_the_default() {
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Info), false),
+            DiagnosticSeverity::Info
+        );
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Hint), true),
+            DiagnosticSeverity::Hint
+        );
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::All), true),
+            DiagnosticSeverity::Hint
+        );
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Error), true),
+            DiagnosticSeverity::Error
+        );
+    }
+
+    #[test]
+    fn panel_max_severity_honours_include_warnings_at_the_default_threshold() {
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Warning), true),
+            DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Warning), false),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            resolve_panel_max_severity(None, true),
+            DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            resolve_panel_max_severity(None, false),
+            DiagnosticSeverity::Error
+        );
+    }
+
+    #[test]
+    fn panel_max_severity_treats_off_as_error() {
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Off), true),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            resolve_panel_max_severity(Some(DiagnosticSeverityContent::Off), false),
+            DiagnosticSeverity::Error
+        );
+    }
 }

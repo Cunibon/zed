@@ -1686,8 +1686,19 @@
     "button": true,
     // Whether to show warnings or not by default.
     //
+    // Deprecated in favour of `max_severity`: `false` only takes effect while
+    // `max_severity` is left at its default of "warning".
+    //
     // Default: true
     "include_warnings": true,
+    // The most lenient severity of diagnostics shown in the project diagnostics
+    // panel and the buffer diagnostics view.
+    //
+    // Possible values: "error", "warning", "info", "hint", "all".
+    // "all" is the same as "hint"; "off" is treated as "error".
+    //
+    // Default: "warning"
+    "max_severity": "warning",
     // Settings for using LSP pull diagnostics mechanism in Zed.
     "lsp_pull_diagnostics": {
       // Whether to pull for diagnostics or not.
