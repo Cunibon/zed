@@ -2375,6 +2375,7 @@ To interpret all `.c` files as C++, files called `MyLockFile` as TOML and files 
   "diagnostics": {
     "button": true,
     "include_warnings": true,
+    "max_severity": "warning",
     "inline": {
       "enabled": false
     }
@@ -2385,7 +2386,8 @@ To interpret all `.c` files as C++, files called `MyLockFile` as TOML and files 
 **Options**
 
 - `button`: Whether to show the project diagnostics button in the status bar
-- `include_warnings`: Whether to show warnings or not by default
+- `include_warnings`: Whether to show warnings or not by default. Deprecated in favour of `max_severity`: `false` only takes effect while `max_severity` is left at its default of `"warning"`
+- `max_severity`: The most lenient severity shown in the project diagnostics panel and the buffer diagnostics view. One of `"error"`, `"warning"`, `"info"`, `"hint"`, or `"all"` (`"all"` is the same as `"hint"`; `"off"` is treated as `"error"`). The severity menu in the panel toolbar and the `diagnostics::SetMaxSeverity` action change the threshold for the current session without editing this setting
 
 ### Inline Diagnostics
 
