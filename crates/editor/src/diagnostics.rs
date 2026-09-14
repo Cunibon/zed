@@ -303,7 +303,20 @@ impl Editor {
         self.refresh_inline_diagnostics(false, window, cx);
     }
 
+    /// Caps the diagnostics this editor shows. Unlike the
+    /// `diagnostics_max_severity` setting, a cap set here survives later
+    /// settings changes: callers such as the diagnostics views own the
+    /// threshold and must not have it silently reset.
     pub fn set_max_diagnostics_severity(&mut self, severity: DiagnosticSeverity, cx: &mut App) {
+        self.diagnostics_max_severity_overridden = true;
+        self.apply_max_diagnostics_severity(severity, cx);
+    }
+
+    pub(crate) fn apply_max_diagnostics_severity(
+        &mut self,
+        severity: DiagnosticSeverity,
+        cx: &mut App,
+    ) {
         self.diagnostics_max_severity = severity;
         self.display_map.update(cx, |display_map, _| {
             display_map.diagnostics_max_severity = self.diagnostics_max_severity;
@@ -328,7 +341,7 @@ impl Editor {
         } else {
             DiagnosticSeverity::Off
         };
-        self.set_max_diagnostics_severity(new_severity, cx);
+        self.apply_max_diagnostics_severity(new_severity, cx);
         if self.diagnostics_enabled {
             self.active_diagnostics = ActiveDiagnostic::None;
             self.refresh_inline_diagnostics(false, window, cx);

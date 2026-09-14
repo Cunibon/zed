@@ -2013,44 +2013,7 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
                 lsp::PublishDiagnosticsParams {
                     uri: lsp::Uri::from_file_path(path!("/test/main.rs")).unwrap(),
                     version: None,
-                    diagnostics: vec![
-                        lsp::Diagnostic {
-                            range: lsp::Range::new(
-                                lsp::Position::new(1, 4),
-                                lsp::Position::new(1, 9),
-                            ),
-                            severity: Some(lsp::DiagnosticSeverity::ERROR),
-                            message: lsp::DiagnosticMessage::from("an error"),
-                            ..Default::default()
-                        },
-                        lsp::Diagnostic {
-                            range: lsp::Range::new(
-                                lsp::Position::new(2, 4),
-                                lsp::Position::new(2, 11),
-                            ),
-                            severity: Some(lsp::DiagnosticSeverity::WARNING),
-                            message: lsp::DiagnosticMessage::from("a warning"),
-                            ..Default::default()
-                        },
-                        lsp::Diagnostic {
-                            range: lsp::Range::new(
-                                lsp::Position::new(3, 4),
-                                lsp::Position::new(3, 8),
-                            ),
-                            severity: Some(lsp::DiagnosticSeverity::INFORMATION),
-                            message: lsp::DiagnosticMessage::from("some info"),
-                            ..Default::default()
-                        },
-                        lsp::Diagnostic {
-                            range: lsp::Range::new(
-                                lsp::Position::new(4, 4),
-                                lsp::Position::new(4, 8),
-                            ),
-                            severity: Some(lsp::DiagnosticSeverity::HINT),
-                            message: lsp::DiagnosticMessage::from("a hint"),
-                            ..Default::default()
-                        },
-                    ],
+                    diagnostics: four_severity_diagnostics(),
                 },
                 None,
                 DiagnosticSourceKind::Pushed,
@@ -2198,6 +2161,148 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
     cx.run_until_parked();
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
+}
+
+#[gpui::test]
+async fn test_project_diagnostics_threshold_survives_settings_changes(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/test"),
+        json!({
+            "main.rs": "
+                fn main() {
+                    error();
+                    warning();
+                    info();
+                    hint();
+                }
+            "
+            .unindent(),
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .unwrap();
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store
+            .update_diagnostics(
+                LanguageServerId(0),
+                lsp::PublishDiagnosticsParams {
+                    uri: lsp::Uri::from_file_path(path!("/test/main.rs")).unwrap(),
+                    version: None,
+                    diagnostics: four_severity_diagnostics(),
+                },
+                None,
+                DiagnosticSourceKind::Pushed,
+                &[],
+                cx,
+            )
+            .unwrap();
+    });
+
+    let diagnostics = window.build_entity(cx, |window, cx| {
+        ProjectDiagnosticsEditor::new(
+            DiagnosticSeverity::Info,
+            project.clone(),
+            workspace.downgrade(),
+            window,
+            cx,
+        )
+    });
+    let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
+    diagnostics
+        .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
+        .await;
+
+    let errors_warnings_and_info = indoc::indoc! {
+        "§ main.rs
+         § -----
+         fn main() {
+             error(); § an error
+             warning(); § a warning
+             info(); § some info
+             hint();
+         }"
+    };
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        errors_warnings_and_info
+    );
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
+        DiagnosticSeverity::Info
+    );
+
+    // An unrelated settings change must not reset the view's threshold.
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.diagnostics.get_or_insert_default().button = Some(false);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
+        DiagnosticSeverity::Info
+    );
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        errors_warnings_and_info
+    );
+
+    // The editor-level cap is documented as not applying to the diagnostics views.
+    cx.update(|_, cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.editor.diagnostics_max_severity = Some(DiagnosticSeverityContent::Error);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    assert_eq!(
+        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
+        DiagnosticSeverity::Info
+    );
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        errors_warnings_and_info
+    );
+}
+
+fn four_severity_diagnostics() -> Vec<lsp::Diagnostic> {
+    [
+        (1, 9, lsp::DiagnosticSeverity::ERROR, "an error"),
+        (2, 11, lsp::DiagnosticSeverity::WARNING, "a warning"),
+        (3, 8, lsp::DiagnosticSeverity::INFORMATION, "some info"),
+        (4, 8, lsp::DiagnosticSeverity::HINT, "a hint"),
+    ]
+    .into_iter()
+    .map(|(row, end_column, severity, message)| lsp::Diagnostic {
+        range: lsp::Range::new(
+            lsp::Position::new(row, 4),
+            lsp::Position::new(row, end_column),
+        ),
+        severity: Some(severity),
+        message: lsp::DiagnosticMessage::from(message),
+        ..Default::default()
+    })
+    .collect()
 }
 
 #[test]
