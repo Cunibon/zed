@@ -7433,7 +7433,11 @@ impl Workspace {
     }
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.is_window_active() {
+        let window_active = window.is_window_active();
+        self.project.update(cx, |project, cx| {
+            project.set_window_active(window_active, cx)
+        });
+        if window_active {
             if let Some(database_id) = self.database_id {
                 let db = WorkspaceDb::global(cx);
                 cx.background_spawn(async move { db.update_timestamp(database_id).await })
@@ -13849,6 +13853,30 @@ mod tests {
         left_pane.read_with(cx, |pane, _| {
             assert_eq!(pane.items_len(), 0);
         });
+    }
+
+    #[gpui::test]
+    async fn test_window_activation_reaches_project(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (_workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        assert!(project.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        cx.deactivate_window();
+        assert!(
+            !project.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "deactivating the window must reach the project"
+        );
+
+        cx.update(|window, _| window.activate_window());
+        cx.executor().run_until_parked();
+        assert!(
+            project.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "re-activating the window must reach the project"
+        );
     }
 
     #[gpui::test]
