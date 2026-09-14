@@ -992,6 +992,7 @@ pub struct Editor {
     select_syntax_node_history: SelectSyntaxNodeHistory,
     ime_transaction: Option<TransactionId>,
     pub diagnostics_max_severity: DiagnosticSeverity,
+    diagnostics_max_severity_overridden: bool,
     active_diagnostics: ActiveDiagnostic,
     show_inline_diagnostics: bool,
     inline_diagnostics_update: Task<()>,
@@ -2366,6 +2367,7 @@ impl Editor {
             inline_diagnostics: Vec::new(),
             soft_wrap_mode_override,
             diagnostics_max_severity,
+            diagnostics_max_severity_overridden: false,
             hard_wrap: None,
             completion_provider: project.clone().map(|project| Rc::new(project) as _),
             semantics_provider: project
@@ -10241,11 +10243,11 @@ impl Editor {
         let accents_changed = new_accents != self.accent_data;
         self.accent_data = new_accents;
 
-        if self.diagnostics_enabled() {
+        if self.diagnostics_enabled() && !self.diagnostics_max_severity_overridden {
             let new_severity = EditorSettings::get_global(cx)
                 .diagnostics_max_severity
                 .unwrap_or(DiagnosticSeverity::Hint);
-            self.set_max_diagnostics_severity(new_severity, cx);
+            self.apply_max_diagnostics_severity(new_severity, cx);
         }
         self.refresh_runnables(None, window, cx);
         self.update_edit_prediction_settings(cx);
