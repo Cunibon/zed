@@ -18,8 +18,13 @@ use language::{BinaryStatus, BufferId, ServerHealth};
 use lsp::{LanguageServerId, LanguageServerName, LanguageServerSelector};
 use path::PathStyle;
 use project::{
-    LspStore, LspStoreEvent, Worktree, lsp_store::log_store::GlobalLogStore,
-    project_settings::ProjectSettings, trusted_worktrees::TrustedWorktrees,
+    LspStore, LspStoreEvent, Worktree, WorktreeId,
+    lsp_store::{
+        ConfiguredLanguageServer, ConfiguredServerState,
+        log_store::{GlobalLogStore, LogStore},
+    },
+    project_settings::ProjectSettings,
+    trusted_worktrees::TrustedWorktrees,
 };
 use settings::{Settings as _, SettingsStore};
 use ui::{
@@ -196,6 +201,15 @@ struct ServerMetadata {
     process_id: Option<u32>,
 }
 
+/// The worktree a server is listed under, resolved up front so that menu items can be
+/// generated without touching entities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorktreeLabel {
+    id: WorktreeId,
+    name: SharedString,
+    is_active: bool,
+}
+
 impl ServerInfo {
     fn server_selector(&self) -> LanguageServerSelector {
         LanguageServerSelector::Id(self.id)
@@ -268,6 +282,10 @@ impl LanguageServerState {
             );
         }
 
+        if self.items.is_empty() {
+            menu = menu.label("No language servers configured for open files");
+        }
+
         let path_style = self
             .workspace
             .upgrade()
@@ -338,6 +356,10 @@ impl LanguageServerState {
                 continue;
             }
 
+            if let LspMenuItem::Configured { server } = item {
+                menu = self.add_configured_server_entry(menu, server.clone(), &lsp_logs, cx);
+                continue;
+            }
             let Some(server_info) = item.server_info() else {
                 continue;
             };
@@ -420,58 +442,13 @@ impl LanguageServerState {
                             let message_for_handler = message.clone();
                             let server_name_for_message = submenu_server_name.clone();
                             submenu = submenu.entry("View Message", None, move |window, cx| {
-                                let Some(create_buffer) = workspace_for_message
-                                    .update(cx, |workspace, cx| {
-                                        workspace.project().update(cx, |project, cx| {
-                                            project.create_buffer(None, false, cx)
-                                        })
-                                    })
-                                    .ok()
-                                else {
-                                    return;
-                                };
-
-                                let window_handle = window.window_handle();
-                                let workspace = workspace_for_message.clone();
-                                let message = message_for_handler.clone();
-                                let server_name = server_name_for_message.clone();
-                                cx.spawn(async move |cx| {
-                                    let buffer = create_buffer.await?;
-                                    buffer.update(cx, |buffer, cx| {
-                                        buffer.edit(
-                                            [(
-                                                0..0,
-                                                format!(
-                                                    "Language server {server_name}:\n\n{message}"
-                                                ),
-                                            )],
-                                            None,
-                                            cx,
-                                        );
-                                        buffer.set_capability(language::Capability::ReadOnly, cx);
-                                    });
-
-                                    workspace.update(cx, |workspace, cx| {
-                                        window_handle.update(cx, |_, window, cx| {
-                                            workspace.add_item_to_active_pane(
-                                                Box::new(cx.new(|cx| {
-                                                    let mut editor = Editor::for_buffer(
-                                                        buffer, None, window, cx,
-                                                    );
-                                                    editor.set_read_only(true);
-                                                    editor
-                                                })),
-                                                None,
-                                                true,
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                    })??;
-
-                                    anyhow::Ok(())
-                                })
-                                .detach();
+                                open_server_message(
+                                    workspace_for_message.clone(),
+                                    server_name_for_message.clone(),
+                                    message_for_handler.clone(),
+                                    window,
+                                    cx,
+                                );
                             });
                         }
 
@@ -564,9 +541,26 @@ impl LanguageServerState {
                                 })
                                 .unwrap_or_default();
 
-                            if !buffers.is_empty() {
-                                lsp_store_for_restart
-                                    .update(cx, |lsp_store, cx| {
+                            lsp_store_for_restart
+                                .update(cx, |lsp_store, cx| {
+                                    if buffers.is_empty() {
+                                        // Without buffers to derive the server from (e.g. right
+                                        // after it was stopped), restart every configured server
+                                        // of this name directly.
+                                        let worktree_ids = lsp_store
+                                            .configured_language_servers()
+                                            .into_iter()
+                                            .filter(|server| server.name == server_name_for_restart)
+                                            .map(|server| server.worktree_id)
+                                            .collect::<Vec<_>>();
+                                        for worktree_id in worktree_ids {
+                                            lsp_store.start_language_server_for(
+                                                worktree_id,
+                                                server_name_for_restart.clone(),
+                                                cx,
+                                            );
+                                        }
+                                    } else {
                                         lsp_store.restart_language_servers_for_buffers(
                                             buffers,
                                             HashSet::from_iter([LanguageServerSelector::Name(
@@ -575,9 +569,9 @@ impl LanguageServerState {
                                             true,
                                             cx,
                                         );
-                                    })
-                                    .ok();
-                            }
+                                    }
+                                })
+                                .ok();
                         });
 
                         if can_stop {
@@ -694,6 +688,205 @@ impl LanguageServerState {
         }
         menu
     }
+
+    fn add_configured_server_entry(
+        &self,
+        menu: ContextMenu,
+        server: ConfiguredLanguageServer,
+        lsp_logs: &Entity<LogStore>,
+        cx: &mut Context<Self>,
+    ) -> ContextMenu {
+        let server_selector = LanguageServerSelector::Name(server.name.clone());
+        let has_logs = self.workspace.upgrade().is_some_and(|workspace| {
+            let project = workspace.read(cx).project();
+            lsp_logs.read(cx).has_server_logs(
+                &server_selector,
+                &project.downgrade(),
+                &self.lsp_store,
+            )
+        });
+        let (status_color, status_label, message) = match &server.state {
+            ConfiguredServerState::Running(_) => (Color::Success, "Running", None),
+            ConfiguredServerState::Starting => (Color::Modified, "Starting…", None),
+            ConfiguredServerState::PendingTrust => (
+                Color::Warning,
+                "Waiting for the project to be trusted",
+                None,
+            ),
+            ConfiguredServerState::Stopped => (Color::Disabled, "Stopped", None),
+            ConfiguredServerState::Suspended { .. } => (Color::Disabled, "Suspended", None),
+            ConfiguredServerState::Failed(error) => (Color::Error, "Error", Some(error.clone())),
+        };
+        let start_label = match &server.state {
+            ConfiguredServerState::Running(_)
+            | ConfiguredServerState::Starting
+            | ConfiguredServerState::Failed(_) => Some("Restart Server"),
+            ConfiguredServerState::Stopped | ConfiguredServerState::Suspended { .. } => {
+                Some("Start Server")
+            }
+            ConfiguredServerState::PendingTrust => None,
+        };
+        let can_stop = matches!(
+            server.state,
+            ConfiguredServerState::Running(_) | ConfiguredServerState::Starting
+        );
+
+        let workspace = self.workspace.clone();
+        let lsp_store = self.lsp_store.clone();
+        let lsp_logs = lsp_logs.clone();
+        menu.submenu_with_colored_icon(
+            server.name.0.clone(),
+            IconName::Circle,
+            status_color,
+            move |mut submenu, _window, _cx| {
+                if let Some(message) = message.clone() {
+                    let workspace = workspace.clone();
+                    let server_name = server.name.clone();
+                    submenu = submenu.entry("View Message", None, move |window, cx| {
+                        open_server_message(
+                            workspace.clone(),
+                            server_name.clone(),
+                            message.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+
+                if has_logs {
+                    let lsp_logs = lsp_logs.clone();
+                    let workspace = workspace.clone();
+                    let server_selector = server_selector.clone();
+                    submenu = submenu.entry("View Logs", None, move |window, cx| {
+                        lsp_log_view::open(
+                            &lsp_logs,
+                            workspace.clone(),
+                            server_selector.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                }
+
+                if let Some(start_label) = start_label {
+                    let lsp_store = lsp_store.clone();
+                    let server_name = server.name.clone();
+                    let worktree_id = server.worktree_id;
+                    submenu = submenu.entry(start_label, None, move |_window, cx| {
+                        lsp_store
+                            .update(cx, |lsp_store, cx| {
+                                lsp_store.start_language_server_for(
+                                    worktree_id,
+                                    server_name.clone(),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    });
+                }
+
+                if can_stop {
+                    let lsp_store = lsp_store.clone();
+                    let server_selector = server_selector.clone();
+                    submenu = submenu.entry("Stop Server", None, move |_window, cx| {
+                        lsp_store
+                            .update(cx, |lsp_store, cx| {
+                                lsp_store
+                                    .stop_language_servers_for_buffers(
+                                        Vec::new(),
+                                        HashSet::from_iter([server_selector.clone()]),
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            })
+                            .ok();
+                    });
+                }
+
+                let message = message.clone();
+                submenu.separator().custom_row(move |_, _| {
+                    v_flex()
+                        .id("metadata-container")
+                        .gap_1()
+                        .when_some(message.as_ref(), |this, _| this.w(rems_from_px(240_f32)))
+                        .child(
+                            h_flex()
+                                .ml_neg_1()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Circle)
+                                        .color(status_color)
+                                        .size(IconSize::Small),
+                                )
+                                .child(
+                                    Label::new(status_label)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .when_some(message.clone(), |container, message| {
+                            container.child(
+                                Label::new(message)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                        })
+                        .into_any_element()
+                })
+            },
+        )
+    }
+}
+
+fn open_server_message(
+    workspace: WeakEntity<Workspace>,
+    server_name: LanguageServerName,
+    message: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(create_buffer) = workspace
+        .update(cx, |workspace, cx| {
+            workspace
+                .project()
+                .update(cx, |project, cx| project.create_buffer(None, false, cx))
+        })
+        .ok()
+    else {
+        return;
+    };
+
+    let window_handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        let buffer = create_buffer.await?;
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(0..0, format!("Language server {server_name}:\n\n{message}"))],
+                None,
+                cx,
+            );
+            buffer.set_capability(language::Capability::ReadOnly, cx);
+        });
+
+        workspace.update(cx, |workspace, cx| {
+            window_handle.update(cx, |_, window, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(cx.new(|cx| {
+                        let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                        editor.set_read_only(true);
+                        editor
+                    })),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            })
+        })??;
+
+        anyhow::Ok(())
+    })
+    .detach();
 }
 
 fn tooltip_for_server_binary(
@@ -800,6 +993,9 @@ enum ServerData<'a> {
         server_name: &'a LanguageServerName,
         binary_status: &'a LanguageServerBinaryStatus,
     },
+    Configured {
+        server: &'a ConfiguredLanguageServer,
+    },
 }
 
 #[derive(Debug)]
@@ -813,6 +1009,10 @@ enum LspMenuItem {
         server_id: LanguageServerId,
         server_name: LanguageServerName,
         binary_status: LanguageServerBinaryStatus,
+    },
+    /// A server known from the configuration only, without a running instance to report on.
+    Configured {
+        server: ConfiguredLanguageServer,
     },
     ToggleServersButton {
         restart: bool,
@@ -828,6 +1028,7 @@ impl LspMenuItem {
         match self {
             Self::Header { .. } => None,
             Self::ToggleServersButton { .. } => None,
+            Self::Configured { .. } => None,
             Self::WithHealthCheck {
                 server_id,
                 health,
@@ -878,6 +1079,9 @@ impl ServerData<'_> {
                 server_id,
                 server_name: server_name.clone(),
                 binary_status: binary_status.clone(),
+            },
+            Self::Configured { server } => LspMenuItem::Configured {
+                server: server.clone(),
             },
         }
     }
@@ -1061,6 +1265,9 @@ impl LspButton {
                 });
                 updated = true;
             }
+            LspStoreEvent::ConfiguredLanguageServersChanged => {
+                updated = true;
+            }
             _ => {}
         };
 
@@ -1071,7 +1278,7 @@ impl LspButton {
 
     fn regenerate_items(&mut self, cx: &mut App) {
         self.server_state.update(cx, |state, cx| {
-            let active_worktrees = state
+            let active_worktree_ids = state
                 .active_editor
                 .as_ref()
                 .into_iter()
@@ -1090,23 +1297,30 @@ impl LspButton {
                                 .filter_map(|buffer| {
                                     project::File::from_dyn(buffer.read(cx).file())
                                 })
-                                .map(|buffer_file| buffer_file.worktree.clone())
+                                .map(|buffer_file| buffer_file.worktree.read(cx).id())
                         })
                 })
                 .collect::<HashSet<_>>();
+            let worktree_label = |worktree: &Entity<Worktree>, cx: &App| {
+                let worktree = worktree.read(cx);
+                WorktreeLabel {
+                    id: worktree.id(),
+                    name: SharedString::new(worktree.root_name_str()),
+                    is_active: active_worktree_ids.contains(&worktree.id()),
+                }
+            };
 
-            let mut server_ids_to_worktrees =
-                HashMap::<LanguageServerId, Entity<Worktree>>::default();
-            let mut server_names_to_worktrees = HashMap::<
-                LanguageServerName,
-                HashSet<(Entity<Worktree>, LanguageServerId)>,
-            >::default();
+            let mut server_ids_to_worktrees = HashMap::<LanguageServerId, WorktreeLabel>::default();
+            let mut server_names_to_worktrees =
+                HashMap::<LanguageServerName, HashSet<(WorktreeLabel, LanguageServerId)>>::default(
+                );
             for servers_for_path in state.language_servers.servers_per_buffer_abs_path.values() {
                 if let Some(worktree) = servers_for_path
                     .worktree
                     .as_ref()
                     .and_then(|worktree| worktree.upgrade())
                 {
+                    let worktree = worktree_label(&worktree, cx);
                     for (server_id, server_name) in &servers_for_path.servers {
                         server_ids_to_worktrees.insert(*server_id, worktree.clone());
                         if let Some(server_name) = server_name {
@@ -1118,16 +1332,15 @@ impl LspButton {
                     }
                 }
             }
-            state
+            let configured_servers = state
                 .lsp_store
                 .update(cx, |lsp_store, cx| {
+                    let worktree_store = lsp_store.worktree_store();
                     for (server_id, status) in lsp_store.language_server_statuses() {
                         if let Some(worktree) = status.worktree.and_then(|worktree_id| {
-                            lsp_store
-                                .worktree_store()
-                                .read(cx)
-                                .worktree_for_id(worktree_id, cx)
+                            worktree_store.read(cx).worktree_for_id(worktree_id, cx)
                         }) {
+                            let worktree = worktree_label(&worktree, cx);
                             server_ids_to_worktrees.insert(server_id, worktree.clone());
                             server_names_to_worktrees
                                 .entry(status.name.clone())
@@ -1135,111 +1348,25 @@ impl LspButton {
                                 .insert((worktree, server_id));
                         }
                     }
+                    lsp_store
+                        .configured_language_servers()
+                        .into_iter()
+                        .filter_map(|server| {
+                            let worktree = worktree_store
+                                .read(cx)
+                                .worktree_for_id(server.worktree_id, cx)?;
+                            Some((worktree_label(&worktree, cx), server))
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .ok();
+                .unwrap_or_default();
 
-            let mut servers_per_worktree = BTreeMap::<SharedString, Vec<ServerData>>::new();
-            let mut servers_with_health_checks = HashSet::default();
-
-            for (server_id, health) in &state.language_servers.health_statuses {
-                let worktree = server_ids_to_worktrees.get(server_id).or_else(|| {
-                    let worktrees = server_names_to_worktrees.get(&health.name)?;
-                    worktrees
-                        .iter()
-                        .find(|(worktree, _)| active_worktrees.contains(worktree))
-                        .or_else(|| worktrees.iter().next())
-                        .map(|(worktree, _)| worktree)
-                });
-                servers_with_health_checks.insert(&health.name);
-                let worktree_name =
-                    worktree.map(|worktree| SharedString::new(worktree.read(cx).root_name_str()));
-
-                let binary_status = state.language_servers.binary_statuses.get(&health.name);
-                let server_data = ServerData::WithHealthCheck {
-                    server_id: *server_id,
-                    health,
-                    binary_status,
-                };
-                if let Some(worktree_name) = worktree_name {
-                    servers_per_worktree
-                        .entry(worktree_name.clone())
-                        .or_default()
-                        .push(server_data);
-                }
-            }
-
-            let mut can_stop_all = !state.language_servers.health_statuses.is_empty();
-            let mut can_restart_all = state.language_servers.health_statuses.is_empty();
-            for (server_name, binary_status) in state
-                .language_servers
-                .binary_statuses
-                .iter()
-                .filter(|(name, _)| !servers_with_health_checks.contains(name))
-            {
-                match binary_status.status {
-                    BinaryStatus::None => {
-                        can_restart_all = false;
-                        can_stop_all |= true;
-                    }
-                    BinaryStatus::CheckingForUpdate => {
-                        can_restart_all = false;
-                        can_stop_all = false;
-                    }
-                    BinaryStatus::Downloading => {
-                        can_restart_all = false;
-                        can_stop_all = false;
-                    }
-                    BinaryStatus::Starting => {
-                        can_restart_all = false;
-                        can_stop_all = false;
-                    }
-                    BinaryStatus::Stopping => {
-                        can_restart_all = false;
-                        can_stop_all = false;
-                    }
-                    BinaryStatus::Stopped => {}
-                    BinaryStatus::Failed { .. } => {}
-                }
-
-                if let Some(worktrees_for_name) = server_names_to_worktrees.get(server_name)
-                    && let Some((worktree, server_id)) = worktrees_for_name
-                        .iter()
-                        .find(|(worktree, _)| active_worktrees.contains(worktree))
-                        .or_else(|| worktrees_for_name.iter().next())
-                {
-                    let worktree_name = SharedString::new(worktree.read(cx).root_name_str());
-                    servers_per_worktree
-                        .entry(worktree_name.clone())
-                        .or_default()
-                        .push(ServerData::WithBinaryStatus {
-                            server_name,
-                            binary_status,
-                            server_id: *server_id,
-                        });
-                }
-            }
-
-            let mut new_lsp_items = Vec::with_capacity(servers_per_worktree.len() + 1);
-            for (worktree_name, worktree_servers) in servers_per_worktree {
-                if worktree_servers.is_empty() {
-                    continue;
-                }
-                new_lsp_items.push(LspMenuItem::Header {
-                    header: Some(worktree_name),
-                    separator: false,
-                });
-                new_lsp_items.extend(worktree_servers.into_iter().map(ServerData::into_lsp_item));
-            }
-            if !new_lsp_items.is_empty() {
-                if can_stop_all {
-                    new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: true });
-                    new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: false });
-                } else if can_restart_all {
-                    new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: true });
-                }
-            }
-
-            state.items = new_lsp_items;
+            state.items = generate_menu_items(
+                &state.language_servers,
+                &server_ids_to_worktrees,
+                &server_names_to_worktrees,
+                &configured_servers,
+            );
         });
     }
 
@@ -1273,6 +1400,103 @@ impl LspButton {
             });
         }
     }
+}
+
+/// Builds the menu rows from the event-derived server state and the configured servers.
+/// Running servers are listed from their statuses; configured servers fill in the rows for
+/// everything that is not running, so stopped and failed servers stay visible.
+fn generate_menu_items(
+    language_servers: &LanguageServers,
+    server_ids_to_worktrees: &HashMap<LanguageServerId, WorktreeLabel>,
+    server_names_to_worktrees: &HashMap<
+        LanguageServerName,
+        HashSet<(WorktreeLabel, LanguageServerId)>,
+    >,
+    configured_servers: &[(WorktreeLabel, ConfiguredLanguageServer)],
+) -> Vec<LspMenuItem> {
+    let preferred_worktree = |worktrees: &HashSet<(WorktreeLabel, LanguageServerId)>| {
+        worktrees
+            .iter()
+            .find(|(worktree, _)| worktree.is_active)
+            .or_else(|| worktrees.iter().next())
+            .cloned()
+    };
+
+    let mut servers_per_worktree = BTreeMap::<SharedString, Vec<ServerData>>::new();
+    let mut shown_servers = HashSet::<(WorktreeId, LanguageServerName)>::default();
+    let mut servers_with_health_checks = HashSet::default();
+
+    for (server_id, health) in &language_servers.health_statuses {
+        let worktree = server_ids_to_worktrees.get(server_id).cloned().or_else(|| {
+            let worktrees = server_names_to_worktrees.get(&health.name)?;
+            preferred_worktree(worktrees).map(|(worktree, _)| worktree)
+        });
+        servers_with_health_checks.insert(&health.name);
+        let binary_status = language_servers.binary_statuses.get(&health.name);
+        if let Some(worktree) = worktree {
+            shown_servers.insert((worktree.id, health.name.clone()));
+            servers_per_worktree.entry(worktree.name).or_default().push(
+                ServerData::WithHealthCheck {
+                    server_id: *server_id,
+                    health,
+                    binary_status,
+                },
+            );
+        }
+    }
+
+    let mut any_server_running = !language_servers.health_statuses.is_empty();
+    for (server_name, binary_status) in language_servers
+        .binary_statuses
+        .iter()
+        .filter(|(name, _)| !servers_with_health_checks.contains(name))
+    {
+        if matches!(binary_status.status, BinaryStatus::None) {
+            any_server_running = true;
+        }
+        if let Some(worktrees_for_name) = server_names_to_worktrees.get(server_name)
+            && let Some((worktree, server_id)) = preferred_worktree(worktrees_for_name)
+        {
+            shown_servers.insert((worktree.id, server_name.clone()));
+            servers_per_worktree.entry(worktree.name).or_default().push(
+                ServerData::WithBinaryStatus {
+                    server_name,
+                    binary_status,
+                    server_id,
+                },
+            );
+        }
+    }
+
+    for (worktree, server) in configured_servers {
+        if !shown_servers.insert((worktree.id, server.name.clone())) {
+            continue;
+        }
+        any_server_running |= server.state.is_running();
+        servers_per_worktree
+            .entry(worktree.name.clone())
+            .or_default()
+            .push(ServerData::Configured { server });
+    }
+
+    let mut new_lsp_items = Vec::with_capacity(servers_per_worktree.len() + 1);
+    for (worktree_name, worktree_servers) in servers_per_worktree {
+        if worktree_servers.is_empty() {
+            continue;
+        }
+        new_lsp_items.push(LspMenuItem::Header {
+            header: Some(worktree_name),
+            separator: false,
+        });
+        new_lsp_items.extend(worktree_servers.into_iter().map(ServerData::into_lsp_item));
+    }
+    if any_server_running {
+        new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: true });
+        new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: false });
+    } else if !new_lsp_items.is_empty() {
+        new_lsp_items.push(LspMenuItem::ToggleServersButton { restart: true });
+    }
+    new_lsp_items
 }
 
 impl StatusItemView for LspButton {
@@ -1480,6 +1704,7 @@ impl Render for LspButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use language::LanguageName;
 
     fn server_id(n: usize) -> LanguageServerId {
         LanguageServerId(n)
@@ -1634,6 +1859,158 @@ mod tests {
             state.health_statuses.contains_key(&server_id(2)),
             "the new server's health entry is present",
         );
+    }
+
+    fn worktree_label(name: &str) -> WorktreeLabel {
+        WorktreeLabel {
+            id: WorktreeId::from_usize(1),
+            name: name.into(),
+            is_active: true,
+        }
+    }
+
+    fn configured_server(name: &str, state: ConfiguredServerState) -> ConfiguredLanguageServer {
+        ConfiguredLanguageServer {
+            name: server_name(name),
+            worktree_id: WorktreeId::from_usize(1),
+            languages: vec![LanguageName::new("Rust")],
+            state,
+        }
+    }
+
+    #[test]
+    fn stopped_configured_server_gets_a_row_and_restart_all() {
+        let items = generate_menu_items(
+            &LanguageServers::default(),
+            &HashMap::default(),
+            &HashMap::default(),
+            &[(
+                worktree_label("dir"),
+                configured_server("rust-analyzer", ConfiguredServerState::Stopped),
+            )],
+        );
+
+        assert!(
+            matches!(&items[0], LspMenuItem::Header { header: Some(header), .. } if header == "dir"),
+            "{items:?}"
+        );
+        assert!(
+            matches!(
+                &items[1],
+                LspMenuItem::Configured { server }
+                    if server.name == server_name("rust-analyzer")
+                        && server.state == ConfiguredServerState::Stopped
+            ),
+            "{items:?}"
+        );
+        assert!(
+            matches!(items[2], LspMenuItem::ToggleServersButton { restart: true }),
+            "{items:?}"
+        );
+        assert_eq!(
+            items.len(),
+            3,
+            "a stopped server offers Restart All but not Stop All: {items:?}"
+        );
+    }
+
+    #[test]
+    fn running_server_row_is_not_duplicated_by_the_configured_list() {
+        let mut language_servers = LanguageServers::default();
+        language_servers.binary_statuses.insert(
+            server_name("rust-analyzer"),
+            LanguageServerBinaryStatus {
+                status: BinaryStatus::None,
+                message: None,
+            },
+        );
+        let mut server_names_to_worktrees = HashMap::default();
+        server_names_to_worktrees.insert(
+            server_name("rust-analyzer"),
+            HashSet::from_iter([(worktree_label("dir"), server_id(1))]),
+        );
+
+        let items = generate_menu_items(
+            &language_servers,
+            &HashMap::default(),
+            &server_names_to_worktrees,
+            &[(
+                worktree_label("dir"),
+                configured_server(
+                    "rust-analyzer",
+                    ConfiguredServerState::Running(server_id(1)),
+                ),
+            )],
+        );
+
+        assert!(
+            matches!(items[1], LspMenuItem::WithBinaryStatus { server_id: id, .. } if id == server_id(1)),
+            "{items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, LspMenuItem::Configured { .. })),
+            "{items:?}"
+        );
+        assert!(matches!(
+            items[2],
+            LspMenuItem::ToggleServersButton { restart: true }
+        ));
+        assert!(matches!(
+            items[3],
+            LspMenuItem::ToggleServersButton { restart: false }
+        ));
+        assert_eq!(items.len(), 4, "{items:?}");
+    }
+
+    #[test]
+    fn failed_configured_server_is_listed_with_its_error() {
+        let mut language_servers = LanguageServers::default();
+        language_servers.binary_statuses.insert(
+            server_name("broken"),
+            LanguageServerBinaryStatus {
+                status: BinaryStatus::Failed {
+                    error: "boom".into(),
+                },
+                message: Some("boom".into()),
+            },
+        );
+
+        let items = generate_menu_items(
+            &language_servers,
+            &HashMap::default(),
+            &HashMap::default(),
+            &[(
+                worktree_label("dir"),
+                configured_server("broken", ConfiguredServerState::Failed("boom".into())),
+            )],
+        );
+
+        assert!(
+            matches!(
+                &items[1],
+                LspMenuItem::Configured { server }
+                    if server.state == ConfiguredServerState::Failed("boom".into())
+            ),
+            "{items:?}"
+        );
+        assert!(
+            matches!(items[2], LspMenuItem::ToggleServersButton { restart: true }),
+            "{items:?}"
+        );
+        assert_eq!(items.len(), 3, "{items:?}");
+    }
+
+    #[test]
+    fn nothing_configured_yields_no_items() {
+        let items = generate_menu_items(
+            &LanguageServers::default(),
+            &HashMap::default(),
+            &HashMap::default(),
+            &[],
+        );
+        assert!(items.is_empty(), "{items:?}");
     }
 
     #[test]
