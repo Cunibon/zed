@@ -1,20 +1,20 @@
 use crate::{
-    BufferDiagnosticsEditor, ProjectDiagnosticsEditor, ToggleDiagnosticsRefresh,
-    toggled_warnings_severity,
+    BufferDiagnosticsEditor, ProjectDiagnosticsEditor, SetMaxSeverity, ToggleDiagnosticsRefresh,
 };
 use agent_settings::AgentSettings;
-use gpui::{Context, EventEmitter, ParentElement, Render, Window};
+use gpui::{Action as _, Context, EventEmitter, ParentElement, Render, Window};
 use language::DiagnosticEntry;
 use project::project_settings::DiagnosticSeverity;
-use settings::Settings;
+use settings::{DiagnosticSeverityContent, Settings};
+use std::sync::Arc;
 use text::{Anchor, BufferId};
-use ui::{Tooltip, prelude::*};
+use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
 use workspace::{ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, item::ItemHandle};
 use zed_actions::assistant::InlineAssist;
 use zed_actions::buffer_search;
 
 pub struct ToolbarControls {
-    editor: Option<Box<dyn DiagnosticsToolbarEditor>>,
+    editor: Option<Arc<dyn DiagnosticsToolbarEditor>>,
 }
 
 pub(crate) trait DiagnosticsToolbarEditor: Send + Sync {
@@ -50,15 +50,9 @@ impl Render for ToolbarControls {
             }
             None => {}
         }
-        let include_warnings = max_severity >= DiagnosticSeverity::Warning;
 
         let is_agent_enabled = AgentSettings::get_global(cx).enabled(cx);
-
-        let (warning_tooltip, warning_color) = if include_warnings {
-            ("Exclude Warnings", Color::Warning)
-        } else {
-            ("Include Warnings", Color::Disabled)
-        };
+        let editor = self.editor.clone();
 
         h_flex()
             .gap_1()
@@ -122,19 +116,88 @@ impl Render for ToolbarControls {
                 }
             })
             .child(
-                IconButton::new("toggle-warnings", IconName::Warning)
-                    .icon_color(warning_color)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text(warning_tooltip))
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        if let Some(editor) = &this.editor {
-                            editor.set_max_severity(
-                                toggled_warnings_severity(editor.max_severity(cx)),
-                                cx,
-                            )
-                        }
-                    })),
+                PopoverMenu::new("diagnostics-max-severity")
+                    .trigger_with_tooltip(
+                        IconButton::new("diagnostics-max-severity-trigger", IconName::Filter)
+                            .icon_size(IconSize::Small),
+                        Tooltip::text(format!(
+                            "Showing {}",
+                            max_severity_description(max_severity)
+                        )),
+                    )
+                    .anchor(gpui::Anchor::TopRight)
+                    .menu(move |window, cx| {
+                        let editor = editor.clone()?;
+                        let max_severity = editor.max_severity(cx);
+                        Some(ContextMenu::build(window, cx, |mut menu, _, _| {
+                            for (label, severity, content) in MAX_SEVERITY_ENTRIES {
+                                let editor = editor.clone();
+                                menu = menu.toggleable_entry(
+                                    label,
+                                    max_severity >= severity,
+                                    IconPosition::Start,
+                                    Some(SetMaxSeverity { severity: content }.boxed_clone()),
+                                    move |_, cx| {
+                                        editor.set_max_severity(
+                                            clicked_max_severity(max_severity, severity),
+                                            cx,
+                                        )
+                                    },
+                                );
+                            }
+                            menu
+                        }))
+                    }),
             )
+    }
+}
+
+const MAX_SEVERITY_ENTRIES: [(&str, DiagnosticSeverity, DiagnosticSeverityContent); 4] = [
+    (
+        "Errors",
+        DiagnosticSeverity::Error,
+        DiagnosticSeverityContent::Error,
+    ),
+    (
+        "Warnings",
+        DiagnosticSeverity::Warning,
+        DiagnosticSeverityContent::Warning,
+    ),
+    (
+        "Info",
+        DiagnosticSeverity::Info,
+        DiagnosticSeverityContent::Info,
+    ),
+    (
+        "Hints",
+        DiagnosticSeverity::Hint,
+        DiagnosticSeverityContent::Hint,
+    ),
+];
+
+fn max_severity_description(max_severity: DiagnosticSeverity) -> &'static str {
+    match max_severity {
+        DiagnosticSeverity::Off | DiagnosticSeverity::Error => "Errors Only",
+        DiagnosticSeverity::Warning => "Errors and Warnings",
+        DiagnosticSeverity::Info => "Errors, Warnings, and Info",
+        DiagnosticSeverity::Hint => "All Diagnostics",
+    }
+}
+
+/// Every level at or above the threshold renders checked, so clicking the
+/// threshold itself reads as unchecking it and moves the threshold one step
+/// stricter. Errors can never be unchecked.
+fn clicked_max_severity(
+    current: DiagnosticSeverity,
+    clicked: DiagnosticSeverity,
+) -> DiagnosticSeverity {
+    if clicked != current {
+        return clicked;
+    }
+    match current {
+        DiagnosticSeverity::Hint => DiagnosticSeverity::Info,
+        DiagnosticSeverity::Info => DiagnosticSeverity::Warning,
+        _ => DiagnosticSeverity::Error,
     }
 }
 
@@ -149,10 +212,10 @@ impl ToolbarItemView for ToolbarControls {
     ) -> ToolbarItemLocation {
         if let Some(pane_item) = active_pane_item.as_ref() {
             if let Some(editor) = pane_item.downcast::<ProjectDiagnosticsEditor>() {
-                self.editor = Some(Box::new(editor.downgrade()));
+                self.editor = Some(Arc::new(editor.downgrade()));
                 ToolbarItemLocation::PrimaryRight
             } else if let Some(editor) = pane_item.downcast::<BufferDiagnosticsEditor>() {
-                self.editor = Some(Box::new(editor.downgrade()));
+                self.editor = Some(Arc::new(editor.downgrade()));
                 ToolbarItemLocation::PrimaryRight
             } else {
                 ToolbarItemLocation::Hidden
@@ -176,5 +239,62 @@ impl ToolbarControls {
 
     fn editor(&self) -> Option<&dyn DiagnosticsToolbarEditor> {
         self.editor.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clicking_the_current_threshold_makes_it_one_step_stricter() {
+        assert_eq!(
+            clicked_max_severity(DiagnosticSeverity::Hint, DiagnosticSeverity::Hint),
+            DiagnosticSeverity::Info
+        );
+        assert_eq!(
+            clicked_max_severity(DiagnosticSeverity::Info, DiagnosticSeverity::Info),
+            DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            clicked_max_severity(DiagnosticSeverity::Warning, DiagnosticSeverity::Warning),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            clicked_max_severity(DiagnosticSeverity::Error, DiagnosticSeverity::Error),
+            DiagnosticSeverity::Error
+        );
+    }
+
+    #[test]
+    fn clicking_another_level_selects_it() {
+        assert_eq!(
+            clicked_max_severity(DiagnosticSeverity::Error, DiagnosticSeverity::Hint),
+            DiagnosticSeverity::Hint
+        );
+        assert_eq!(
+            clicked_max_severity(DiagnosticSeverity::Hint, DiagnosticSeverity::Warning),
+            DiagnosticSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn menu_entries_cover_every_panel_level_in_order() {
+        let levels: Vec<_> = MAX_SEVERITY_ENTRIES
+            .iter()
+            .map(|(_, severity, _)| *severity)
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                DiagnosticSeverity::Error,
+                DiagnosticSeverity::Warning,
+                DiagnosticSeverity::Info,
+                DiagnosticSeverity::Hint,
+            ]
+        );
+        for (_, severity, content) in MAX_SEVERITY_ENTRIES {
+            assert_eq!(DiagnosticSeverity::from(content), severity);
+        }
     }
 }
