@@ -3732,6 +3732,179 @@ async fn test_toggling_enable_language_server(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_toggling_enable_language_server_via_worktree_settings(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({ "a.rs": "", ".zed": { "settings.json": "{}" } }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+
+    let _rs_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+
+    let mut fake_rust_server_1 = fake_rust_servers.next().await.unwrap();
+    assert_eq!(
+        fake_rust_server_1
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
+    );
+
+    fs.save(
+        path!("/dir/.zed/settings.json").as_ref(),
+        &r#"{ "languages": { "Rust": { "enable_language_server": false } } }"#.into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+
+    fs.save(
+        path!("/dir/.zed/settings.json").as_ref(),
+        &r#"{ "languages": { "Rust": { "enable_language_server": true } } }"#.into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+    let mut fake_rust_server_2 = fake_rust_servers.next().await.unwrap();
+    assert_eq!(
+        fake_rust_server_2
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
+    );
+}
+
+#[gpui::test]
+async fn test_stop_all_language_servers_is_reversible(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.rs": "" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+
+    let (buffer_a, _handle_a) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_1 = fake_rust_servers.next().await.unwrap();
+    assert_eq!(
+        fake_rust_server_1
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
+    );
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+
+    // Opening another buffer of the same language must respect the stop:
+    // no server may be started until the user explicitly asks for one.
+    let (_buffer_b, _handle_b) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    assert!(
+        fake_rust_servers.next().now_or_never().flatten().is_none(),
+        "no language server should start while all servers are stopped"
+    );
+
+    // `editor::RestartLanguageServer` restarts the servers of the editor's buffers
+    // with `clear_stopped`, which must revive servers after "Stop All".
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![buffer_a.clone()],
+            HashSet::default(),
+            true,
+            cx,
+        );
+    });
+    let mut fake_rust_server_2 = fake_rust_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("a language server should start after restarting with clear_stopped")
+        .unwrap();
+    let opened_after_restart = BTreeSet::from_iter([
+        fake_rust_server_2
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .to_string(),
+        fake_rust_server_2
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .to_string(),
+    ]);
+    assert_eq!(
+        opened_after_restart,
+        BTreeSet::from_iter([
+            uri!("file:///dir/a.rs").to_string(),
+            uri!("file:///dir/b.rs").to_string(),
+        ])
+    );
+}
+
+#[gpui::test]
 async fn test_updating_lsp_settings_sends_one_did_change_configuration(
     cx: &mut gpui::TestAppContext,
 ) {
