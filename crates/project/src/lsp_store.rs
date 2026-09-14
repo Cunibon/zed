@@ -288,6 +288,21 @@ struct LanguageServerSeed {
     settings: LanguageServerSeedSettings,
 }
 
+/// Identifies configured language servers that must stay stopped until an explicit start.
+/// A `None` component widens the key to every worktree or every server, so
+/// `{ worktree_id: None, name: None }` covers all servers of the project.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SuppressionKey {
+    pub worktree_id: Option<WorktreeId>,
+    pub name: Option<LanguageServerName>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressionReason {
+    UserStopped,
+    Suspended { since: Instant },
+}
+
 #[derive(Debug)]
 pub struct DocumentDiagnosticsUpdate<'a, D> {
     pub diagnostics: D,
@@ -357,8 +372,7 @@ pub struct LocalLspStore {
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
     >,
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
-    all_language_servers_stopped: bool,
-    stopped_language_servers: HashSet<LanguageServerName>,
+    suppressed_servers: HashMap<SuppressionKey, SuppressionReason>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -366,6 +380,116 @@ pub struct LocalLspStore {
 }
 
 impl LocalLspStore {
+    fn suppression_for(
+        &self,
+        worktree_id: WorktreeId,
+        name: &LanguageServerName,
+    ) -> Option<SuppressionReason> {
+        [
+            SuppressionKey {
+                worktree_id: None,
+                name: None,
+            },
+            SuppressionKey {
+                worktree_id: Some(worktree_id),
+                name: None,
+            },
+            SuppressionKey {
+                worktree_id: None,
+                name: Some(name.clone()),
+            },
+            SuppressionKey {
+                worktree_id: Some(worktree_id),
+                name: Some(name.clone()),
+            },
+        ]
+        .iter()
+        .find_map(|key| self.suppressed_servers.get(key).copied())
+    }
+
+    fn suppress_all_servers(&mut self, reason: SuppressionReason) {
+        self.suppressed_servers.insert(
+            SuppressionKey {
+                worktree_id: None,
+                name: None,
+            },
+            reason,
+        );
+    }
+
+    fn suppress_servers(
+        &mut self,
+        names: impl IntoIterator<Item = LanguageServerName>,
+        reason: SuppressionReason,
+    ) {
+        for name in names {
+            self.suppressed_servers.insert(
+                SuppressionKey {
+                    worktree_id: None,
+                    name: Some(name),
+                },
+                reason,
+            );
+        }
+    }
+
+    fn clear_all_suppressions(&mut self) {
+        self.suppressed_servers.clear();
+    }
+
+    /// Lifts every suppression covering `name` in `worktree_id` (in every worktree when `None`).
+    /// A wider suppression that also covers other configured servers is narrowed down to
+    /// those servers, so they stay stopped.
+    fn clear_suppression(&mut self, worktree_id: Option<WorktreeId>, name: &LanguageServerName) {
+        let configured_servers = self.configured_server_keys();
+        let mut narrowed_suppressions = Vec::new();
+        self.suppressed_servers.retain(|key, reason| {
+            let covers_worktree = key.worktree_id.is_none()
+                || worktree_id.is_none()
+                || key.worktree_id == worktree_id;
+            let covers_name = key.name.as_ref().is_none_or(|key_name| key_name == name);
+            if !(covers_worktree && covers_name) {
+                return true;
+            }
+            for (configured_worktree_id, configured_name) in &configured_servers {
+                let is_cleared = configured_name == name
+                    && worktree_id.is_none_or(|worktree_id| worktree_id == *configured_worktree_id);
+                let is_covered_by_key = key
+                    .worktree_id
+                    .is_none_or(|key_worktree_id| key_worktree_id == *configured_worktree_id)
+                    && key
+                        .name
+                        .as_ref()
+                        .is_none_or(|key_name| key_name == configured_name);
+                if is_covered_by_key && !is_cleared {
+                    narrowed_suppressions.push((
+                        SuppressionKey {
+                            worktree_id: Some(*configured_worktree_id),
+                            name: Some(configured_name.clone()),
+                        },
+                        *reason,
+                    ));
+                }
+            }
+            false
+        });
+        self.suppressed_servers.extend(narrowed_suppressions);
+    }
+
+    fn configured_server_keys(&self) -> BTreeSet<(WorktreeId, LanguageServerName)> {
+        self.lsp_tree
+            .instances
+            .iter()
+            .flat_map(|(worktree_id, servers)| {
+                servers
+                    .roots
+                    .values()
+                    .flat_map(|roots| roots.keys())
+                    .map(move |name| (*worktree_id, name.clone()))
+            })
+            .collect()
+    }
+
     /// Returns the running language server for the given ID. Note if the language server is starting, it will not be returned.
     pub fn running_language_server_for_id(
         &self,
@@ -3091,9 +3215,6 @@ impl LocalLspStore {
         only_register_servers: HashSet<LanguageServerSelector>,
         cx: &mut Context<LspStore>,
     ) {
-        if self.all_language_servers_stopped {
-            return;
-        }
         let buffer = buffer_handle.read(cx);
         let buffer_id = buffer.remote_id();
 
@@ -3165,7 +3286,7 @@ impl LocalLspStore {
                     return None;
                 }
                 if let Some(name) = server_node.name()
-                    && self.stopped_language_servers.contains(&name)
+                    && self.suppression_for(worktree_id, &name).is_some()
                 {
                     return None;
                 }
@@ -3997,6 +4118,8 @@ impl LocalLspStore {
         cx: &mut Context<LspStore>,
     ) -> Vec<LanguageServerId> {
         self.restricted_worktrees_tasks.remove(&id_to_remove);
+        self.suppressed_servers
+            .retain(|key, _| key.worktree_id != Some(id_to_remove));
         self.diagnostics.remove(&id_to_remove);
         self.prettier_store.update(cx, |prettier_store, cx| {
             prettier_store.remove_worktree(id_to_remove, cx);
@@ -4911,8 +5034,7 @@ impl LspStore {
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
-                all_language_servers_stopped: false,
-                stopped_language_servers: HashSet::default(),
+                suppressed_servers: HashMap::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -6300,16 +6422,10 @@ impl LspStore {
             .semantic_token_config
             .update_global_mode(new_global_semantic_tokens_mode)
         {
-            let all_stopped = self
-                .as_local()
-                .is_some_and(|local| local.all_language_servers_stopped);
-            if !all_stopped {
-                // Restart servers without clearing per-server stopped status.
-                // Individually-stopped servers will be skipped by the guard in
-                // register_buffer_with_language_servers.
-                let buffers = self.buffer_store.read(cx).buffers().collect();
-                self.restart_language_servers_for_buffers(buffers, HashSet::default(), false, cx);
-            }
+            // Restart servers without clearing suppressions: stopped servers are
+            // skipped by the guard in register_buffer_with_language_servers.
+            let buffers = self.buffer_store.read(cx).buffers().collect();
+            self.restart_language_servers_for_buffers(buffers, HashSet::default(), false, cx);
         }
 
         cx.notify();
@@ -6320,10 +6436,6 @@ impl LspStore {
         let Some(local) = self.as_local_mut() else {
             return;
         };
-        if local.all_language_servers_stopped {
-            return;
-        }
-        let stopped_language_servers = local.stopped_language_servers.clone();
         let mut adapters = BTreeMap::default();
         let get_adapter = {
             let languages = local.languages.clone();
@@ -6407,7 +6519,7 @@ impl LspStore {
                         .collect::<Vec<_>>();
                     for node in nodes {
                         if let Some(name) = node.name()
-                            && stopped_language_servers.contains(&name)
+                            && local.suppression_for(worktree_id, &name).is_some()
                         {
                             continue;
                         }
@@ -12930,9 +13042,12 @@ impl LspStore {
 
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
-            local.all_language_servers_stopped = true;
+            local.suppress_all_servers(SuppressionReason::UserStopped);
         }
         self.shutdown_all_language_servers(cx).detach();
+        // Shutting down removes the servers' tree nodes; rebuilding the tree keeps the
+        // stopped servers listed as configured without starting them.
+        self.refresh_server_tree(cx);
     }
 
     pub fn shutdown_all_language_servers(&mut self, cx: &mut Context<Self>) -> Task<()> {
@@ -12968,12 +13083,40 @@ impl LspStore {
 
     pub fn restart_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
-            local.all_language_servers_stopped = false;
+            local.clear_all_suppressions();
         }
-        // `restart_language_servers_for_buffers` with empty selectors and `clear_stopped`
-        // clears `stopped_language_servers` for us.
         let buffers = self.buffer_store.read(cx).buffers().collect();
         self.restart_language_servers_for_buffers(buffers, HashSet::default(), true, cx);
+    }
+
+    /// Starts (or restarts) the language server `name` rooted in `worktree_id`, regardless
+    /// of which buffers are open, lifting any suppression that kept it stopped.
+    pub fn start_language_server_for(
+        &mut self,
+        worktree_id: WorktreeId,
+        name: LanguageServerName,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        local.clear_suppression(Some(worktree_id), &name);
+        let existing_servers = local
+            .language_server_ids
+            .iter()
+            .filter(|(seed, _)| seed.worktree_id == worktree_id && seed.name == name)
+            .map(|(_, server)| server.id)
+            .collect::<BTreeSet<_>>();
+        local.lsp_tree.remove_nodes(&existing_servers);
+        let stop_tasks = existing_servers
+            .into_iter()
+            .map(|server_id| self.stop_local_language_server(server_id, cx))
+            .collect::<Vec<_>>();
+        cx.spawn(async move |lsp_store, cx| {
+            futures::future::join_all(stop_tasks).await;
+            lsp_store.update(cx, |lsp_store, cx| lsp_store.refresh_server_tree(cx))
+        })
+        .detach();
     }
 
     pub fn restart_language_servers_for_buffers(
@@ -13028,15 +13171,16 @@ impl LspStore {
                                 // A full restart of these buffers un-suppresses every
                                 // manually-stopped server, even ones that are no longer
                                 // running (and so weren't returned in `stopped_names`).
-                                local.stopped_language_servers.clear();
+                                local.clear_all_suppressions();
                             } else {
-                                for name in &stopped_names {
-                                    local.stopped_language_servers.remove(name);
-                                }
-                                for selector in &only_restart_servers {
-                                    if let LanguageServerSelector::Name(name) = selector {
-                                        local.stopped_language_servers.remove(name);
-                                    }
+                                let selected_names = only_restart_servers.iter().filter_map(
+                                    |selector| match selector {
+                                        LanguageServerSelector::Name(name) => Some(name),
+                                        LanguageServerSelector::Id(_) => None,
+                                    },
+                                );
+                                for name in stopped_names.iter().chain(selected_names) {
+                                    local.clear_suppression(None, name);
                                 }
                             }
                         }
@@ -13098,8 +13242,9 @@ impl LspStore {
             let (stopped_names, task) =
                 self.stop_local_language_servers_for_buffers(&buffers, also_stop_servers, cx);
             if let Some(local) = self.as_local_mut() {
-                local.stopped_language_servers.extend(stopped_names);
+                local.suppress_servers(stopped_names, SuppressionReason::UserStopped);
             }
+            self.refresh_server_tree(cx);
             cx.background_spawn(async move {
                 task.await;
                 Ok(())

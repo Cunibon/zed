@@ -3732,9 +3732,7 @@ async fn test_toggling_enable_language_server(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_toggling_enable_language_server_via_worktree_settings(
-    cx: &mut gpui::TestAppContext,
-) {
+async fn test_toggling_enable_language_server_via_worktree_settings(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -3902,6 +3900,153 @@ async fn test_stop_all_language_servers_is_reversible(cx: &mut gpui::TestAppCont
             uri!("file:///dir/b.rs").to_string(),
         ])
     );
+
+    // A buffer-independent start (what the LSP menu's "Start Server" uses) must
+    // revive a server after "Stop All" as well.
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    fake_rust_server_2
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.start_language_server_for(
+            worktree_id,
+            LanguageServerName::new_static("rust-lsp"),
+            cx,
+        );
+    });
+    let mut fake_rust_server_3 = fake_rust_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("a language server should start after start_language_server_for")
+        .unwrap();
+    let opened_after_start = BTreeSet::from_iter([
+        fake_rust_server_3
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .to_string(),
+        fake_rust_server_3
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .to_string(),
+    ]);
+    assert_eq!(
+        opened_after_start,
+        BTreeSet::from_iter([
+            uri!("file:///dir/a.rs").to_string(),
+            uri!("file:///dir/b.rs").to_string(),
+        ])
+    );
+}
+
+#[gpui::test]
+async fn test_starting_one_server_after_stop_all_keeps_others_stopped(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.js": "" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+
+    let mut fake_rust_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    let mut fake_js_servers = language_registry.register_fake_lsp(
+        "JavaScript",
+        FakeLspAdapter {
+            name: "js-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+    language_registry.add(js_lang());
+
+    let _rs_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let _js_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.js"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_1 = fake_rust_servers.next().await.unwrap();
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    let mut fake_js_server_1 = fake_js_servers.next().await.unwrap();
+    fake_js_server_1
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    fake_rust_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+    fake_js_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.start_language_server_for(
+            worktree_id,
+            LanguageServerName::new_static("rust-lsp"),
+            cx,
+        );
+    });
+    let mut fake_rust_server_2 = fake_rust_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("the started server should come up")
+        .unwrap();
+    fake_rust_server_2
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    cx.executor().run_until_parked();
+    assert!(
+        fake_js_servers.next().now_or_never().flatten().is_none(),
+        "starting one server must not revive the other stopped server"
+    );
+
+    lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.restart_all_language_servers(cx);
+    });
+    let mut fake_js_server_2 = fake_js_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("restart all should start every stopped server")
+        .unwrap();
+    fake_js_server_2
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
 }
 
 #[gpui::test]
