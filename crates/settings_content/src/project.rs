@@ -262,6 +262,24 @@ pub struct GlobalLspSettingsContent {
     /// Default: `20000`
     #[schemars(range(min = 1))]
     pub max_buffer_line_length: Option<u32>,
+    /// How many minutes a project's window may stay inactive before its language servers are
+    /// suspended. Suspended servers are shut down to free memory and start again as soon as the
+    /// window becomes active. This keeps several windows of a large monorepo (for example a
+    /// Flutter monorepo, where every window runs its own Dart analysis server) from each holding
+    /// gigabytes of memory while only one of them is in use.
+    ///
+    /// Default: `null` (never suspend)
+    #[schemars(range(min = 1))]
+    pub suspend_after_inactive_minutes: Option<u64>,
+    /// The maximum number of projects that may run language servers at the same time. Activating
+    /// a window beyond this budget suspends the language servers of the least recently active
+    /// project; they start again when that window becomes active. Together with
+    /// `suspend_after_inactive_minutes` this bounds the memory language servers use when many
+    /// windows of a monorepo are open.
+    ///
+    /// Default: `null` (unlimited)
+    #[schemars(range(min = 1))]
+    pub max_active_projects: Option<usize>,
     /// Settings for language server notifications
     pub notifications: Option<LspNotificationSettingsContent>,
     /// Rules for rendering LSP semantic tokens.

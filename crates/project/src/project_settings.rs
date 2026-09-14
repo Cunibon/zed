@@ -137,6 +137,12 @@ pub struct GlobalLspSettings {
     ///
     /// Default: `20000`
     pub max_buffer_line_length: u32,
+    /// How many minutes a project's window may stay inactive before its language servers are
+    /// suspended, or `None` to never suspend them.
+    pub suspend_after_inactive_minutes: Option<u64>,
+    /// The maximum number of projects that may run language servers at the same time, or `None`
+    /// for no limit.
+    pub max_active_projects: Option<usize>,
     pub notifications: LspNotificationSettings,
 
     /// Rules for highlighting semantic tokens.
@@ -149,6 +155,8 @@ impl Default for GlobalLspSettings {
             button: true,
             request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
             max_buffer_line_length: 20_000,
+            suspend_after_inactive_minutes: None,
+            max_active_projects: None,
             notifications: LspNotificationSettings::default(),
             semantic_token_rules: SemanticTokenRules::default(),
         }
@@ -161,6 +169,20 @@ impl GlobalLspSettings {
     /// simply call unwrap_or_default.
     pub const fn get_request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout)
+    }
+
+    /// Returns how long a project's window may stay inactive before its language servers
+    /// are suspended, or `None` when suspension is disabled.
+    pub fn suspend_after_inactive(&self) -> Option<Duration> {
+        self.suspend_after_inactive_minutes
+            .filter(|minutes| *minutes > 0)
+            .map(|minutes| Duration::from_secs(minutes.saturating_mul(60)))
+    }
+
+    /// Returns the maximum number of projects that may run language servers at the same
+    /// time, or `None` when the number is not limited.
+    pub fn max_active_projects(&self) -> Option<usize> {
+        self.max_active_projects.filter(|count| *count > 0)
     }
 }
 
@@ -779,6 +801,14 @@ impl Settings for ProjectSettings {
                     .unwrap()
                     .max_buffer_line_length
                     .unwrap(),
+                suspend_after_inactive_minutes: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .and_then(|settings| settings.suspend_after_inactive_minutes),
+                max_active_projects: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .and_then(|settings| settings.max_active_projects),
                 notifications: LspNotificationSettings {
                     dismiss_timeout_ms: content
                         .global_lsp_settings

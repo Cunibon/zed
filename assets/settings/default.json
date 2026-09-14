@@ -2708,6 +2708,17 @@
     //
     // Default: 20000
     "max_buffer_line_length": 20000,
+    // How many minutes a project's window may stay inactive before its language servers are
+    // suspended to free memory. They start again as soon as the window becomes active.
+    //
+    // Default: null (never suspend)
+    "suspend_after_inactive_minutes": null,
+    // The maximum number of projects that may run language servers at the same time. Activating
+    // a window beyond this budget suspends the language servers of the least recently active
+    // project until that window becomes active again.
+    //
+    // Default: null (unlimited)
+    "max_active_projects": null,
     "notifications": {
       // Timeout in milliseconds for automatically dismissing language server notifications.
       // Set to 0 to disable auto-dismiss.
