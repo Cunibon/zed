@@ -3886,6 +3886,7 @@ impl Project {
             LspStoreEvent::WorkspaceEditApplied(transaction) => {
                 cx.emit(Event::WorkspaceEditApplied(transaction.clone()))
             }
+            LspStoreEvent::ConfiguredLanguageServersChanged => {}
         }
     }
 

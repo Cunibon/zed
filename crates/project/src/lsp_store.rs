@@ -303,6 +303,32 @@ pub enum SuppressionReason {
     Suspended { since: Instant },
 }
 
+/// A language server that the settings configure for at least one open buffer,
+/// whether or not it is currently running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredLanguageServer {
+    pub name: LanguageServerName,
+    pub worktree_id: WorktreeId,
+    pub languages: Vec<LanguageName>,
+    pub state: ConfiguredServerState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfiguredServerState {
+    Running(LanguageServerId),
+    Starting,
+    PendingTrust,
+    Stopped,
+    Suspended { since: Instant },
+    Failed(SharedString),
+}
+
+impl ConfiguredServerState {
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+}
+
 #[derive(Debug)]
 pub struct DocumentDiagnosticsUpdate<'a, D> {
     pub diagnostics: D,
@@ -373,6 +399,7 @@ pub struct LocalLspStore {
     >,
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     suppressed_servers: HashMap<SuppressionKey, SuppressionReason>,
+    failed_language_servers: HashMap<LanguageServerId, SharedString>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -474,6 +501,37 @@ impl LocalLspStore {
             false
         });
         self.suppressed_servers.extend(narrowed_suppressions);
+    }
+
+    fn configured_server_state(
+        &self,
+        worktree_id: WorktreeId,
+        name: &LanguageServerName,
+        server_id: Option<LanguageServerId>,
+    ) -> ConfiguredServerState {
+        if let Some(server_id) = server_id {
+            match self.language_servers.get(&server_id) {
+                Some(LanguageServerState::Running { .. }) => {
+                    return ConfiguredServerState::Running(server_id);
+                }
+                Some(LanguageServerState::Starting { .. }) => {
+                    if let Some(error) = self.failed_language_servers.get(&server_id) {
+                        return ConfiguredServerState::Failed(error.clone());
+                    }
+                    if self.restricted_worktrees_tasks.contains_key(&worktree_id) {
+                        return ConfiguredServerState::PendingTrust;
+                    }
+                    return ConfiguredServerState::Starting;
+                }
+                None => {}
+            }
+        }
+        match self.suppression_for(worktree_id, name) {
+            Some(SuppressionReason::Suspended { since }) => {
+                ConfiguredServerState::Suspended { since }
+            }
+            Some(SuppressionReason::UserStopped) | None => ConfiguredServerState::Stopped,
+        }
     }
 
     fn configured_server_keys(&self) -> BTreeSet<(WorktreeId, LanguageServerName)> {
@@ -794,16 +852,22 @@ impl LocalLspStore {
 
                     Err(err) => {
                         let log = stderr_capture.lock().take().unwrap_or_default();
-                        delegate.update_status(
-                            adapter.name(),
-                            BinaryStatus::Failed {
-                                error: if log.is_empty() {
-                                    format!("{err:#}")
-                                } else {
-                                    format!("{err:#}\n-- stderr --\n{log}")
-                                },
-                            },
-                        );
+                        let error = if log.is_empty() {
+                            format!("{err:#}")
+                        } else {
+                            format!("{err:#}\n-- stderr --\n{log}")
+                        };
+                        lsp_store
+                            .update(cx, |lsp_store, cx| {
+                                if let Some(local) = lsp_store.as_local_mut() {
+                                    local
+                                        .failed_language_servers
+                                        .insert(server_id, SharedString::from(error.clone()));
+                                }
+                                cx.emit(LspStoreEvent::ConfiguredLanguageServersChanged);
+                            })
+                            .ok();
+                        delegate.update_status(adapter.name(), BinaryStatus::Failed { error });
                         log::error!(
                             "Failed to start language server {server_name:?}: {}",
                             redact_command(&format!("{err:?}"))
@@ -4147,6 +4211,7 @@ impl LocalLspStore {
             self.last_workspace_edits_by_language_server
                 .remove(server_id_to_remove);
             self.language_servers.remove(server_id_to_remove);
+            self.failed_language_servers.remove(server_id_to_remove);
             self.language_server_dynamic_registrations
                 .remove(server_id_to_remove);
             self.initial_server_capabilities.remove(server_id_to_remove);
@@ -4743,6 +4808,8 @@ pub enum LspStoreEvent {
         message: proto::update_language_server::Variant,
     },
     LanguageServerLog(LanguageServerId, LanguageServerLogType, String),
+    /// The set of configured language servers, or the state of one of them, changed.
+    ConfiguredLanguageServersChanged,
     LanguageServerPrompt(LanguageServerPromptRequest),
     LanguageDetected {
         buffer: Entity<Buffer>,
@@ -5035,6 +5102,7 @@ impl LspStore {
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
                 suppressed_servers: HashMap::default(),
+                failed_language_servers: HashMap::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -6588,6 +6656,7 @@ impl LspStore {
         for (id, _) in to_stop {
             self.stop_local_language_server(id, cx).detach();
         }
+        cx.emit(LspStoreEvent::ConfiguredLanguageServersChanged);
     }
 
     fn can_resolve_lsp_action_for_buffer(
@@ -11823,6 +11892,42 @@ impl LspStore {
         }
     }
 
+    /// Lists every language server the settings configure for the registered buffers,
+    /// one entry per worktree and server name, including servers that are not running.
+    pub fn configured_language_servers(&self) -> Vec<ConfiguredLanguageServer> {
+        let Some(local) = self.as_local() else {
+            return Vec::new();
+        };
+        let mut configured_servers =
+            BTreeMap::<(WorktreeId, LanguageServerName), ConfiguredLanguageServer>::new();
+        for (worktree_id, servers_for_worktree) in &local.lsp_tree.instances {
+            for servers_for_root in servers_for_worktree.roots.values() {
+                for (name, (node, languages)) in servers_for_root {
+                    let state = local.configured_server_state(*worktree_id, name, node.id());
+                    let configured_server = configured_servers
+                        .entry((*worktree_id, name.clone()))
+                        .or_insert_with(|| ConfiguredLanguageServer {
+                            name: name.clone(),
+                            worktree_id: *worktree_id,
+                            languages: Vec::new(),
+                            state: state.clone(),
+                        });
+                    for language in languages {
+                        if !configured_server.languages.contains(language) {
+                            configured_server.languages.push(language.clone());
+                        }
+                    }
+                    // Several roots of one worktree may share a server; a root that has
+                    // started it describes the server better than one that has not.
+                    if !configured_server.state.is_running() && state.is_running() {
+                        configured_server.state = state;
+                    }
+                }
+            }
+        }
+        configured_servers.into_values().collect()
+    }
+
     pub fn language_server_statuses(
         &self,
     ) -> impl DoubleEndedIterator<Item = (LanguageServerId, &LanguageServerStatus)> {
@@ -13000,6 +13105,7 @@ impl LspStore {
         local.initial_server_capabilities.remove(&server_id);
 
         let server_state = local.language_servers.remove(&server_id);
+        local.failed_language_servers.remove(&server_id);
         self.cleanup_lsp_data(server_id);
         let name = self
             .language_server_statuses
