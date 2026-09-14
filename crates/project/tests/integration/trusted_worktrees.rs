@@ -1,14 +1,18 @@
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 
 use collections::HashSet;
-use gpui::{Entity, TestAppContext};
+use futures::{FutureExt as _, StreamExt as _};
+use gpui::{Entity, FutureExt as _, TestAppContext};
+use language::{FakeLspAdapter, rust_lang};
 use serde_json::json;
 use settings::SettingsStore;
 use util::path;
 
 use crate::{FakeFs, Project};
 
-use project::{trusted_worktrees::*, worktree_store::WorktreeStore};
+use project::{
+    lsp_store::ConfiguredServerState, trusted_worktrees::*, worktree_store::WorktreeStore,
+};
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -953,5 +957,129 @@ async fn test_invisible_worktree_stores_do_not_affect_trust(cx: &mut TestAppCont
             store.restricted_worktrees_for_store(&worktree_store)
         }),
         "only visible worktrees should be restricted"
+    );
+}
+
+#[gpui::test]
+async fn test_language_servers_follow_worktree_trust(cx: &mut TestAppContext) {
+    crate::init_test(cx);
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let worktree_id = worktree_store.read_with(cx, |store, cx| {
+        store.worktrees().next().unwrap().read(cx).id()
+    });
+    let trusted_worktrees = init_trust_global(worktree_store.clone(), cx);
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+
+    let configured_states = |cx: &mut TestAppContext| {
+        lsp_store.read_with(cx, |lsp_store, _| {
+            lsp_store
+                .configured_language_servers()
+                .into_iter()
+                .map(|server| server.state)
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let _buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/root/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        fake_servers.next().now_or_never().flatten().is_none(),
+        "no language server may start while the worktree is restricted"
+    );
+    assert_eq!(
+        configured_states(cx),
+        vec![ConfiguredServerState::PendingTrust]
+    );
+
+    trusted_worktrees.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+            cx,
+        );
+    });
+    let mut fake_server_1 = fake_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("trusting the worktree should start its language server")
+        .unwrap();
+    fake_server_1
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    cx.run_until_parked();
+    assert_eq!(
+        configured_states(cx),
+        vec![ConfiguredServerState::Running(
+            fake_server_1.server.server_id()
+        )]
+    );
+
+    trusted_worktrees.update(cx, |store, cx| {
+        store.restrict(
+            worktree_store.downgrade(),
+            HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+            cx,
+        );
+    });
+    fake_server_1
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("restricting the worktree should shut its language server down");
+    cx.run_until_parked();
+    assert!(
+        fake_servers.next().now_or_never().flatten().is_none(),
+        "no language server may start while the worktree is restricted again"
+    );
+    assert_eq!(
+        configured_states(cx),
+        vec![ConfiguredServerState::PendingTrust]
+    );
+
+    trusted_worktrees.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+            cx,
+        );
+    });
+    let mut fake_server_2 = fake_servers
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("trusting the worktree again should start a new language server")
+        .unwrap();
+    fake_server_2
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    cx.run_until_parked();
+    assert_eq!(
+        configured_states(cx),
+        vec![ConfiguredServerState::Running(
+            fake_server_2.server.server_id()
+        )]
     );
 }

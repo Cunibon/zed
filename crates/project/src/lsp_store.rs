@@ -398,6 +398,7 @@ pub struct LocalLspStore {
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
     >,
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
+    trusted_worktrees_subscription: Option<Subscription>,
     suppressed_servers: HashMap<SuppressionKey, SuppressionReason>,
     failed_language_servers: HashMap<LanguageServerId, SharedString>,
 
@@ -641,6 +642,28 @@ impl LocalLspStore {
             "attempting to start language server {:?}, path: {worktree_abs_path:?}, id: {server_id}",
             adapter.name.0
         );
+
+        if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx)
+            && self.trusted_worktrees_subscription.is_none()
+        {
+            let lsp_store = self.weak.clone();
+            self.trusted_worktrees_subscription =
+                Some(cx.subscribe(&trusted_worktrees, move |_, event, cx| {
+                    if let TrustedWorktreesEvent::Restricted(worktree_store, restricted_paths) =
+                        event
+                    {
+                        lsp_store
+                            .update(cx, |lsp_store, cx| {
+                                lsp_store.on_worktrees_restricted(
+                                    worktree_store,
+                                    restricted_paths,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    }
+                }));
+        }
 
         let wait_until_worktree_trust =
             TrustedWorktrees::try_get_global(cx).and_then(|trusted_worktrees| {
@@ -5101,6 +5124,7 @@ impl LspStore {
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
+                trusted_worktrees_subscription: None,
                 suppressed_servers: HashMap::default(),
                 failed_language_servers: HashMap::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
@@ -13213,8 +13237,61 @@ impl LspStore {
             .filter(|(seed, _)| seed.worktree_id == worktree_id && seed.name == name)
             .map(|(_, server)| server.id)
             .collect::<BTreeSet<_>>();
-        local.lsp_tree.remove_nodes(&existing_servers);
-        let stop_tasks = existing_servers
+        self.stop_language_servers_then_refresh_tree(existing_servers, cx);
+    }
+
+    /// Shuts down the servers rooted in worktrees that just became restricted, so that
+    /// rebuilding the tree parks them on the worktree trust again until it is granted.
+    fn on_worktrees_restricted(
+        &mut self,
+        worktree_store: &WeakEntity<WorktreeStore>,
+        restricted_paths: &HashSet<PathTrust>,
+        cx: &mut Context<Self>,
+    ) {
+        if *worktree_store != self.worktree_store.downgrade() {
+            return;
+        }
+        let Some(local) = self.as_local() else {
+            return;
+        };
+        let restricted_worktrees = restricted_paths
+            .iter()
+            .filter_map(|restricted_path| match restricted_path {
+                PathTrust::Worktree(worktree_id) => Some(*worktree_id),
+                PathTrust::AbsPath(_) => None,
+            })
+            // Servers of a worktree that is already waiting for trust are parked, not running.
+            .filter(|worktree_id| !local.restricted_worktrees_tasks.contains_key(worktree_id))
+            .collect::<HashSet<_>>();
+        if restricted_worktrees.is_empty() {
+            return;
+        }
+        let mut servers_to_stop = BTreeSet::new();
+        let mut servers_to_preserve = HashSet::default();
+        for (seed, server) in &local.language_server_ids {
+            if restricted_worktrees.contains(&seed.worktree_id) {
+                servers_to_stop.insert(server.id);
+            } else {
+                servers_to_preserve.insert(server.id);
+            }
+        }
+        servers_to_stop.retain(|server_id| !servers_to_preserve.contains(server_id));
+        if servers_to_stop.is_empty() {
+            return;
+        }
+        self.stop_language_servers_then_refresh_tree(servers_to_stop, cx);
+    }
+
+    fn stop_language_servers_then_refresh_tree(
+        &mut self,
+        server_ids: BTreeSet<LanguageServerId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        local.lsp_tree.remove_nodes(&server_ids);
+        let stop_tasks = server_ids
             .into_iter()
             .map(|server_id| self.stop_local_language_server(server_id, cx))
             .collect::<Vec<_>>();
