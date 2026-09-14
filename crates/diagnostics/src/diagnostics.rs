@@ -17,7 +17,7 @@ use editor::{
     multibuffer_context_lines,
 };
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FocusOutEvent,
+    Action, AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, FocusOutEvent,
     Focusable, Global, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     Styled, Subscription, Task, WeakEntity, Window, actions, div,
 };
@@ -30,7 +30,9 @@ use project::{
     DiagnosticSummary, Project, ProjectPath,
     project_settings::{DiagnosticSeverity, ProjectSettings},
 };
-use settings::{Settings, SettingsStore};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use settings::{DiagnosticSeverityContent, Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
     cmp,
@@ -61,6 +63,24 @@ actions!(
         ToggleDiagnosticsRefresh
     ]
 );
+
+/// Shows diagnostics up to and including the given severity in the
+/// diagnostics views. `off` is treated as `error` and `all` as `hint`.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = diagnostics)]
+#[serde(deny_unknown_fields)]
+pub struct SetMaxSeverity {
+    pub severity: DiagnosticSeverityContent,
+}
+
+/// `Off` would leave a diagnostics view permanently empty, so it is clamped
+/// to the strictest useful threshold.
+pub(crate) fn panel_max_severity(severity: DiagnosticSeverityContent) -> DiagnosticSeverity {
+    match DiagnosticSeverity::from(severity) {
+        DiagnosticSeverity::Off => DiagnosticSeverity::Error,
+        severity => severity,
+    }
+}
 
 /// Shared by every open diagnostics view so that changing the threshold in
 /// one view changes it in all of them.
@@ -163,6 +183,7 @@ impl Render for ProjectDiagnosticsEditor {
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_action(cx.listener(Self::toggle_warnings))
+            .on_action(cx.listener(Self::handle_set_max_severity))
             .on_action(cx.listener(Self::toggle_diagnostics_refresh))
             .child(child)
     }
@@ -431,6 +452,15 @@ impl ProjectDiagnosticsEditor {
 
     fn toggle_warnings(&mut self, _: &ToggleWarnings, _: &mut Window, cx: &mut Context<Self>) {
         self.set_max_severity(toggled_warnings_severity(self.max_severity), cx);
+    }
+
+    fn handle_set_max_severity(
+        &mut self,
+        action: &SetMaxSeverity,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_max_severity(panel_max_severity(action.severity), cx);
     }
 
     pub(crate) fn set_max_severity(

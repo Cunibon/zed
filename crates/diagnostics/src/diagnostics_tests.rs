@@ -2069,6 +2069,9 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
             cx,
         )
     });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(diagnostics.clone()), None, true, window, cx)
+    });
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
     diagnostics
         .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
@@ -2171,6 +2174,45 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     assert_eq!(
         editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
         DiagnosticSeverity::Hint
+    );
+
+    // The toolbar drives the threshold through the `DiagnosticsToolbarEditor` trait.
+    let toolbar_editor: Arc<dyn DiagnosticsToolbarEditor> = Arc::new(diagnostics.downgrade());
+    cx.update(|_, cx| toolbar_editor.set_max_severity(DiagnosticSeverity::Warning, cx));
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| toolbar_editor.max_severity(cx)),
+        DiagnosticSeverity::Warning
+    );
+    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_and_warnings);
+
+    // The action is bindable to any level; `off` would hide everything, so it
+    // is clamped to errors.
+    cx.dispatch_action(SetMaxSeverity {
+        severity: DiagnosticSeverityContent::Off,
+    });
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
+}
+
+#[test]
+fn panel_max_severity_never_hides_everything() {
+    assert_eq!(
+        panel_max_severity(DiagnosticSeverityContent::Off),
+        DiagnosticSeverity::Error
+    );
+    assert_eq!(
+        panel_max_severity(DiagnosticSeverityContent::All),
+        DiagnosticSeverity::Hint
+    );
+    assert_eq!(
+        panel_max_severity(DiagnosticSeverityContent::Info),
+        DiagnosticSeverity::Info
     );
 }
 
@@ -2589,6 +2631,42 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
              § hint: move occurs because `x` has type `Vec<char>`, which does not
              § implement the `Copy` trait
              } § a hint"
+        }
+    );
+
+    buffer_diagnostics.update_in(cx, |buffer_diagnostics, window, cx| {
+        buffer_diagnostics.handle_set_max_severity(
+            &SetMaxSeverity {
+                severity: DiagnosticSeverityContent::Error,
+            },
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        indoc::indoc! {
+            "§ main.rs
+             § -----
+             fn main() {
+                 let x = vec![];
+             § move occurs because `x` has type `Vec<char>`, which does not implement
+             § the `Copy` trait (back)
+                 let y = vec![];
+                 a(x); § value moved here
+                 b(y);
+                 c(y);
+                 d(x);
+             § use of moved value
+             § value used here after move
+             § hint: move occurs because `x` has type `Vec<char>`, which does not
+             § implement the `Copy` trait
+             }"
         }
     );
 }

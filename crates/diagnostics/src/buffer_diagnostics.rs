@@ -1,7 +1,8 @@
 use crate::{
-    DIAGNOSTICS_UPDATE_DEBOUNCE, PanelMaxSeverity, ToggleWarnings, context_range_for_entry,
+    DIAGNOSTICS_UPDATE_DEBOUNCE, PanelMaxSeverity, SetMaxSeverity, ToggleWarnings,
+    context_range_for_entry,
     diagnostic_renderer::{DiagnosticBlock, DiagnosticRenderer},
-    initial_max_severity, toggled_warnings_severity,
+    initial_max_severity, panel_max_severity, toggled_warnings_severity,
     toolbar_controls::DiagnosticsToolbarEditor,
 };
 use anyhow::Result;
@@ -672,6 +673,15 @@ impl BufferDiagnosticsEditor {
         self.set_max_severity(toggled_warnings_severity(self.max_severity), cx);
     }
 
+    pub(crate) fn handle_set_max_severity(
+        &mut self,
+        action: &SetMaxSeverity,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_max_severity(panel_max_severity(action.severity), cx);
+    }
+
     pub(crate) fn set_max_severity(
         &mut self,
         max_severity: DiagnosticSeverity,
@@ -993,6 +1003,8 @@ impl Render for BufferDiagnosticsEditor {
             .key_context("Diagnostics")
             .track_focus(&self.focus_handle(cx))
             .size_full()
+            .on_action(cx.listener(Self::toggle_warnings))
+            .on_action(cx.listener(Self::handle_set_max_severity))
             .child(child)
     }
 }
