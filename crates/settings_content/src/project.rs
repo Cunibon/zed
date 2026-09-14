@@ -820,8 +820,21 @@ pub struct DiagnosticsSettingsContent {
 
     /// Whether or not to include warning diagnostics.
     ///
+    /// Deprecated in favour of `max_severity`: setting this to `false` only
+    /// takes effect while `max_severity` is left at its default (`warning`),
+    /// in which case the panel shows errors only.
+    ///
     /// Default: true
     pub include_warnings: Option<bool>,
+
+    /// The most lenient severity of diagnostics shown in the project
+    /// diagnostics panel and the buffer diagnostics view.
+    ///
+    /// Possible values: `error`, `warning`, `info`, `hint`, `all`.
+    /// `all` is the same as `hint`; `off` is treated as `error`.
+    ///
+    /// Default: warning
+    pub max_severity: Option<DiagnosticSeverityContent>,
 
     /// Settings for using LSP pull diagnostics mechanism in Zed.
     pub lsp_pull_diagnostics: Option<LspPullDiagnosticsSettingsContent>,
