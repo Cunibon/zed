@@ -7434,8 +7434,14 @@ impl Workspace {
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let window_active = window.is_window_active();
+        // macOS reports every window as active when the application gains focus; only the
+        // platform's active window may resume its project and enforce the server budget.
+        let project_window_active = window_active
+            && cx
+                .active_window()
+                .is_some_and(|active_window| active_window == window.window_handle());
         self.project.update(cx, |project, cx| {
-            project.set_window_active(window_active, cx)
+            project.set_window_active(project_window_active, cx)
         });
         if window_active {
             if let Some(database_id) = self.database_id {
@@ -13876,6 +13882,74 @@ mod tests {
         assert!(
             project.read_with(cx, |project, cx| project.is_window_active(cx)),
             "re-activating the window must reach the project"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_spurious_activation_of_background_window_does_not_activate_its_project(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let window_a =
+            cx.add_window(|window, cx| Workspace::test_new(project_a.clone(), window, cx));
+        let window_b =
+            cx.add_window(|window, cx| Workspace::test_new(project_b.clone(), window, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(window_b.into()));
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        // macOS reports every window as active when the application regains focus, so
+        // window A hears that it is active while window B remains the key window.
+        cx.simulate_window_active_status_change(window_a.into(), true);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| window_a.is_active(cx)), Some(true));
+        assert!(
+            !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "a window that is not the platform's active window must not activate its project"
+        );
+        assert!(
+            project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "the platform's active window must keep its project active"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_spurious_activation_of_background_window_keeps_active_project(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let window_a =
+            cx.add_window(|window, cx| Workspace::test_new(project_a.clone(), window, cx));
+        let window_b =
+            cx.add_window(|window, cx| Workspace::test_new(project_b.clone(), window, cx));
+        cx.run_until_parked();
+        window_a
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(window_a.into()));
+        assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        cx.simulate_window_active_status_change(window_b.into(), true);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| window_b.is_active(cx)), Some(true));
+        assert!(
+            project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "the platform's active window must keep its project active"
+        );
+        assert!(
+            !project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "a window that is not the platform's active window must not activate its project"
         );
     }
 
