@@ -13185,6 +13185,11 @@ impl LspStore {
             }
         };
 
+        let seed_name = local
+            .language_server_ids
+            .iter()
+            .find(|(_, state)| state.id == server_id)
+            .map(|(seed, _)| seed.name.clone());
         // Remove this server ID from all entries in the given worktree.
         local
             .language_server_ids
@@ -13291,6 +13296,10 @@ impl LspStore {
         }
 
         if server_state.is_some() {
+            // A server without a status entry has not finished starting yet.
+            if let Some(name) = seed_name {
+                log::info!("stopping language server {name} before it finished starting");
+            }
             cx.emit(LspStoreEvent::LanguageServerRemoved(server_id));
         }
         Task::ready(())
@@ -13352,21 +13361,28 @@ impl LspStore {
         };
         self.idle_suspend_task = Some(cx.spawn(async move |lsp_store, cx| {
             cx.background_executor().timer(idle_suspension_delay).await;
+            let reason = format!("idle for {} min", idle_suspension_delay.as_secs() / 60);
             lsp_store
-                .update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx))
+                .update(cx, |lsp_store, cx| {
+                    lsp_store.suspend_language_servers(&reason, cx)
+                })
                 .ok();
         }));
     }
 
     /// Shuts every language server down while keeping them listed as configured, so that
     /// they start again as soon as the project resumes.
-    pub fn suspend_language_servers(&mut self, cx: &mut Context<Self>) {
+    pub fn suspend_language_servers(&mut self, reason: &str, cx: &mut Context<Self>) {
         let Some(local) = self.as_local_mut() else {
             return;
         };
         if !local.suspend_all_servers() {
             return;
         }
+        log::info!(
+            "suspending language servers of {}: {reason}",
+            self.project_name_for_log(cx)
+        );
         self.shutdown_all_language_servers(cx).detach();
         // Shutting down removes the servers' tree nodes; rebuilding the tree keeps the
         // suspended servers listed as configured without starting them.
@@ -13381,8 +13397,23 @@ impl LspStore {
             matches!(reason, SuppressionReason::Suspended { .. })
         });
         if resumed {
+            log::info!(
+                "resuming language servers of {}",
+                self.project_name_for_log(cx)
+            );
             self.refresh_server_tree(cx);
         }
+    }
+
+    /// The absolute path of the project's first visible worktree, to identify the project
+    /// in log messages.
+    fn project_name_for_log(&self, cx: &App) -> String {
+        self.worktree_store
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().display().to_string())
+            .unwrap_or_else(|| "project".to_string())
     }
 
     fn enforce_active_project_budget(&mut self, cx: &mut Context<Self>) {
@@ -13409,7 +13440,7 @@ impl LspStore {
         for lsp_store in other_active_projects.into_iter().take(projects_over_budget) {
             lsp_store.update(cx, |lsp_store, cx| {
                 if grace_period.is_zero() {
-                    lsp_store.suspend_language_servers(cx);
+                    lsp_store.suspend_language_servers("over budget", cx);
                 } else {
                     lsp_store.arm_budget_suspension(grace_period, cx);
                 }
@@ -13455,7 +13486,7 @@ impl LspStore {
             .filter(|lsp_store| lsp_store.read(cx).counts_toward_active_project_budget())
             .count();
         if more_recently_active_projects >= max_active_projects {
-            self.suspend_language_servers(cx);
+            self.suspend_language_servers("over budget", cx);
         }
     }
 
