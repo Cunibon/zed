@@ -13290,9 +13290,14 @@ impl LspStore {
     /// resumes them and, within `max_active_projects`, suspends the least recently active
     /// other projects.
     pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        let was_active = self.window_active;
         self.window_active = active;
         if !active {
-            self.arm_idle_suspension(cx);
+            // A window may report its deactivation more than once; re-arming the timer each
+            // time would postpone the idle suspension indefinitely.
+            if was_active || self.idle_suspend_task.is_none() {
+                self.arm_idle_suspension(cx);
+            }
             return;
         }
         self.idle_suspend_task = None;

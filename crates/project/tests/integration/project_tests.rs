@@ -4381,6 +4381,51 @@ async fn test_reactivation_cancels_pending_suspension(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
+async fn test_idle_suspend_timer_survives_repeated_deactivation(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(Some(10), None, None, cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
+    let SuspensionFixture {
+        project,
+        lsp_store,
+        mut fake_rust_servers,
+    } = suspension_fixture(fs, path!("/dir").as_ref(), cx).await;
+
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server = fake_rust_servers.next().await.unwrap();
+    fake_rust_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    project.update(cx, |project, cx| project.set_window_active(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(5 * 60));
+    cx.executor().run_until_parked();
+    // Deactivating an already inactive window again must not postpone the suspension.
+    project.update(cx, |project, cx| project.set_window_active(false, cx));
+    cx.executor().advance_clock(Duration::from_secs(5 * 60));
+    cx.executor().run_until_parked();
+
+    fake_rust_server
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("the language server should exit ten minutes after the first deactivation");
+    cx.executor().run_until_parked();
+    let states = configured_server_states(&lsp_store, cx);
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_matches!(states[0], ConfiguredServerState::Suspended { .. });
+}
+
+#[gpui::test]
 async fn test_suspension_disabled_by_default(cx: &mut gpui::TestAppContext) {
     use project::lsp_store::ConfiguredServerState;
 
