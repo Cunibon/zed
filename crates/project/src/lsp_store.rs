@@ -544,6 +544,13 @@ impl LocalLspStore {
         })
     }
 
+    /// Whether this project takes one of the `max_active_projects` slots: it may run language
+    /// servers and at least one of them is starting or running. Windows without servers, such
+    /// as a folder of notes, must not evict the servers of a project that is doing work.
+    fn counts_toward_active_project_budget(&self) -> bool {
+        self.may_run_language_servers() && !self.language_servers.is_empty()
+    }
+
     /// Lifts every suppression covering `name` in `worktree_id` (in every worktree when `None`).
     /// A wider suppression that also covers other configured servers is narrowed down to
     /// those servers, so they stay stopped.
@@ -13285,6 +13292,11 @@ impl LspStore {
         self.window_active
     }
 
+    fn counts_toward_active_project_budget(&self) -> bool {
+        self.as_local()
+            .is_some_and(|local| local.counts_toward_active_project_budget())
+    }
+
     /// Records whether a window showing this project is active. An inactive project suspends
     /// its language servers once `suspend_after_inactive_minutes` have passed; an active one
     /// resumes them and, within `max_active_projects`, suspends the least recently active
@@ -13365,18 +13377,11 @@ impl LspStore {
         else {
             return;
         };
-        let this_project_is_active = self
-            .as_local()
-            .is_some_and(|local| local.may_run_language_servers());
+        let this_project_is_active = self.counts_toward_active_project_budget();
         let other_active_projects = other_projects
             .into_iter()
             .filter_map(|lsp_store| lsp_store.upgrade())
-            .filter(|lsp_store| {
-                lsp_store
-                    .read(cx)
-                    .as_local()
-                    .is_some_and(|local| local.may_run_language_servers())
-            })
+            .filter(|lsp_store| lsp_store.read(cx).counts_toward_active_project_budget())
             .collect::<Vec<_>>();
         // The activating project always keeps its servers; the others give theirs up
         // least recently active first.
