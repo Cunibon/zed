@@ -1363,6 +1363,7 @@ pub struct PreviousWorkspaceState {
 pub struct WorkspaceStore {
     workspaces: HashSet<(gpui::AnyWindowHandle, WeakEntity<Workspace>)>,
     client: Arc<Client>,
+    pending_project_activation: Option<Task<()>>,
     _subscriptions: Vec<client::Subscription>,
 }
 
@@ -1626,7 +1627,6 @@ pub struct Workspace {
     bounds: Bounds<Pixels>,
     pub centered_layout: bool,
     bounds_save_task_queued: Option<Task<()>>,
-    pending_project_activation: Option<Task<()>>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
     on_prompt_for_open_path: Option<PromptForOpenPath>,
     terminal_provider: Option<Box<dyn TerminalProvider>>,
@@ -2135,7 +2135,6 @@ impl Workspace {
             bounds: Default::default(),
             centered_layout: false,
             bounds_save_task_queued: None,
-            pending_project_activation: None,
             on_prompt_for_new_path: None,
             on_prompt_for_open_path: None,
             terminal_provider: None,
@@ -7436,35 +7435,23 @@ impl Workspace {
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let window_active = window.is_window_active();
+        log::debug!(
+            "window activation callback: window {:?} active={window_active}",
+            window.window_handle().window_id()
+        );
         if window_active {
-            // macOS reports every window as active when the application gains focus, and
-            // AppKit makes several windows key one after another while GPUI delivers each
-            // window's callback asynchronously, so more than one callback can observe its
-            // own window as the platform's active window. Only that window may resume its
-            // project and enforce the server budget, so decide once the sequence has settled.
-            self.pending_project_activation = Some(cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-                this.update_in(cx, |this, window, cx| {
-                    let project_window_active = window.is_window_active()
-                        && cx
-                            .active_window()
-                            .is_some_and(|active_window| active_window == window.window_handle());
-                    this.project.update(cx, |project, cx| {
-                        project.set_window_active(project_window_active, cx)
-                    });
-                    this.pending_project_activation.take();
-                })
-                .ok();
-            }));
+            // macOS reports every window as active when the application gains focus, so this
+            // callback alone cannot tell whether the user focused this window. The shared
+            // workspace store decides for all windows once the key-window burst has ended.
+            self.app_state
+                .workspace_store
+                .update(cx, |store, cx| store.schedule_project_activation(cx));
             if let Some(database_id) = self.database_id {
                 let db = WorkspaceDb::global(cx);
                 cx.background_spawn(async move { db.update_timestamp(database_id).await })
                     .detach();
             }
         } else {
-            self.pending_project_activation.take();
             self.project
                 .update(cx, |project, cx| project.set_window_active(false, cx));
             // When window is deactivated, flush any deferred saves since focus has left the window
@@ -10050,7 +10037,58 @@ impl WorkspaceStore {
                 client.add_message_handler(cx.weak_entity(), Self::handle_update_followers),
             ],
             client,
+            pending_project_activation: None,
         }
+    }
+
+    /// Decides once, for every open window, which project may resume its language servers,
+    /// after the platform has finished re-keying its windows.
+    ///
+    /// macOS reports every window as active when the application gains focus, makes several
+    /// windows key one after another and delivers each window's callback asynchronously, so a
+    /// per-window check can run while that window is momentarily the platform's active window.
+    /// Restarting a single timer on every callback and reading the active window once for all
+    /// workspaces after the burst has ended activates exactly one project, however long the
+    /// burst takes.
+    pub fn schedule_project_activation(&mut self, cx: &mut Context<Self>) {
+        self.pending_project_activation = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
+            this.update(cx, |this, cx| {
+                let active_window = cx.active_window();
+                let mut settled_on = None;
+                this.workspaces.retain(|(window_handle, weak_workspace)| {
+                    let Some(workspace) = weak_workspace.upgrade() else {
+                        return false;
+                    };
+                    let window_active = Some(*window_handle) == active_window;
+                    workspace.update(cx, |workspace, cx| {
+                        if window_active {
+                            settled_on = Some(
+                                workspace
+                                    .visible_worktrees(cx)
+                                    .next()
+                                    .map(|worktree| {
+                                        worktree.read(cx).abs_path().display().to_string()
+                                    })
+                                    .unwrap_or_else(|| "a window without worktrees".to_string()),
+                            );
+                        }
+                        workspace.project.update(cx, |project, cx| {
+                            project.set_window_active(window_active, cx)
+                        });
+                    });
+                    true
+                });
+                log::info!(
+                    "project activation settled on {}",
+                    settled_on.as_deref().unwrap_or("no window")
+                );
+                this.pending_project_activation.take();
+            })
+            .ok();
+        }));
     }
 
     pub fn update_followers(
@@ -13878,6 +13916,94 @@ mod tests {
         });
     }
 
+    /// Opens a workspace window on a shared `AppState`, the way the real application does,
+    /// so that windows share the `WorkspaceStore` that arbitrates project activation.
+    fn add_workspace_window(
+        project: &Entity<Project>,
+        app_state: &Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) -> WindowHandle<Workspace> {
+        let project = project.clone();
+        let app_state = app_state.clone();
+        cx.add_window(|window, cx| {
+            Workspace::new(Default::default(), project, app_state, window, cx)
+        })
+    }
+
+    #[gpui::test]
+    async fn test_long_activation_burst_activates_only_the_final_key_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let app_state = cx.update(|cx| AppState::test(cx));
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs.clone(), [], cx).await;
+        let project_c = Project::test(fs, [], cx).await;
+        let window_a = add_workspace_window(&project_a, &app_state, cx);
+        let window_b = add_workspace_window(&project_b, &app_state, cx);
+        let window_c = add_workspace_window(&project_c, &app_state, cx);
+        cx.run_until_parked();
+
+        // Windows B and C sit in the background. The user last worked in window A before
+        // leaving the application, so A remains the platform's active window while every
+        // project is inactive.
+        cx.simulate_window_active_status_change(window_b.into(), false);
+        cx.simulate_window_active_status_change(window_c.into(), false);
+        window_a
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_c.read_with(cx, |project, cx| project.is_window_active(cx)));
+        cx.simulate_window_active_status_change(window_a.into(), false);
+        cx.run_until_parked();
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(window_a.into()));
+
+        // When the application regains focus, AppKit makes A, then B, then C key. Each key
+        // change renders a frame synchronously, so on a stalled main thread the gaps between
+        // the callbacks are longer than any per-window settle delay.
+        cx.simulate_window_active_status_change(window_a.into(), true);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        assert!(
+            !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "a window re-keyed early in a long burst must not activate its project"
+        );
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        cx.simulate_window_active_status_change(window_b.into(), true);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(
+            !project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "a window re-keyed in the middle of a long burst must not activate its project"
+        );
+
+        window_c
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(
+            project_c.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "only the window that is active once the burst has ended may activate its project"
+        );
+    }
+
     #[gpui::test]
     async fn test_window_activation_reaches_project(cx: &mut gpui::TestAppContext) {
         init_test(cx);
@@ -13900,7 +14026,7 @@ mod tests {
             !project.read_with(cx, |project, cx| project.is_window_active(cx)),
             "an activation must wait until the key-window sequence has settled"
         );
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.executor().run_until_parked();
         assert!(
             project.read_with(cx, |project, cx| project.is_window_active(cx)),
@@ -13914,15 +14040,18 @@ mod tests {
     ) {
         init_test(cx);
 
+        let app_state = cx.update(|cx| AppState::test(cx));
         let fs = FakeFs::new(cx.executor());
         let project_a = Project::test(fs.clone(), [], cx).await;
         let project_b = Project::test(fs, [], cx).await;
-        let window_a =
-            cx.add_window(|window, cx| Workspace::test_new(project_a.clone(), window, cx));
-        let window_b =
-            cx.add_window(|window, cx| Workspace::test_new(project_b.clone(), window, cx));
+        let window_a = add_workspace_window(&project_a, &app_state, cx);
+        let window_b = add_workspace_window(&project_b, &app_state, cx);
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(300));
+        window_b
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| cx.active_window()), Some(window_b.into()));
         assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
@@ -13933,7 +14062,7 @@ mod tests {
         cx.simulate_window_active_status_change(window_a.into(), true);
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| window_a.is_active(cx)), Some(true));
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert!(
             !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
@@ -13951,19 +14080,18 @@ mod tests {
     ) {
         init_test(cx);
 
+        let app_state = cx.update(|cx| AppState::test(cx));
         let fs = FakeFs::new(cx.executor());
         let project_a = Project::test(fs.clone(), [], cx).await;
         let project_b = Project::test(fs, [], cx).await;
-        let window_a =
-            cx.add_window(|window, cx| Workspace::test_new(project_a.clone(), window, cx));
-        let window_b =
-            cx.add_window(|window, cx| Workspace::test_new(project_b.clone(), window, cx));
+        let window_a = add_workspace_window(&project_a, &app_state, cx);
+        let window_b = add_workspace_window(&project_b, &app_state, cx);
         cx.run_until_parked();
         window_a
             .update(cx, |_, window, _| window.activate_window())
             .unwrap();
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| cx.active_window()), Some(window_a.into()));
         assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
@@ -13972,7 +14100,7 @@ mod tests {
         cx.simulate_window_active_status_change(window_b.into(), true);
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| window_b.is_active(cx)), Some(true));
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert!(
             project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
@@ -13990,15 +14118,18 @@ mod tests {
     ) {
         init_test(cx);
 
+        let app_state = cx.update(|cx| AppState::test(cx));
         let fs = FakeFs::new(cx.executor());
         let project_a = Project::test(fs.clone(), [], cx).await;
         let project_b = Project::test(fs, [], cx).await;
-        let window_a =
-            cx.add_window(|window, cx| Workspace::test_new(project_a.clone(), window, cx));
-        let window_b =
-            cx.add_window(|window, cx| Workspace::test_new(project_b.clone(), window, cx));
+        let window_a = add_workspace_window(&project_a, &app_state, cx);
+        let window_b = add_workspace_window(&project_b, &app_state, cx);
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(300));
+        window_b
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
         assert!(project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
@@ -14022,7 +14153,7 @@ mod tests {
         assert_eq!(cx.update(|cx| cx.active_window()), Some(window_b.into()));
         assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
 
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert!(
             !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
@@ -14042,7 +14173,7 @@ mod tests {
         let project = Project::test(fs, [], cx).await;
         let (_workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert!(project.read_with(cx, |project, cx| project.is_window_active(cx)));
 
@@ -14057,11 +14188,11 @@ mod tests {
         assert!(!project.read_with(cx, |project, cx| project.is_window_active(cx)));
         cx.deactivate_window();
         assert!(!project.read_with(cx, |project, cx| project.is_window_active(cx)));
-        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.executor().advance_clock(Duration::from_millis(800));
         cx.run_until_parked();
         assert!(
             !project.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "a deactivation during the settle delay must cancel the pending activation"
+            "a deactivation during the settle delay must leave the project inactive"
         );
     }
 
@@ -14078,25 +14209,77 @@ mod tests {
 
         cx.update(|window, _| window.activate_window());
         cx.executor().run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.executor().advance_clock(Duration::from_millis(400));
         cx.run_until_parked();
         assert!(!project.read_with(cx, |project, cx| project.is_window_active(cx)));
 
         // A second activation of the same window arrives while the first is still pending.
         cx.simulate_active_status_change(true);
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.executor().advance_clock(Duration::from_millis(400));
         cx.run_until_parked();
         assert!(
             !project.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "a repeated activation must replace the pending one rather than let it fire"
+            "a repeated activation must restart the settle delay rather than let the first fire"
         );
 
-        cx.executor().advance_clock(Duration::from_millis(150));
+        cx.executor().advance_clock(Duration::from_millis(400));
         cx.run_until_parked();
         assert!(
             project.read_with(cx, |project, cx| project.is_window_active(cx)),
             "the coalesced activation must reach the project once the delay has elapsed"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_window_closed_during_activation_burst_keeps_decision_for_the_others(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let app_state = cx.update(|cx| AppState::test(cx));
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let window_a = add_workspace_window(&project_a, &app_state, cx);
+        let window_b = add_workspace_window(&project_b, &app_state, cx);
+        cx.run_until_parked();
+        window_b
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        window_a
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        // Window B closes while the decision for the burst is still pending.
+        window_b
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| window_b.is_active(cx)), None);
+
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(
+            project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "the remaining window must still get its decision"
+        );
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert_eq!(
+            app_state
+                .workspace_store
+                .read_with(cx, |store, _| store.workspaces().count()),
+            1,
+            "the closed workspace must be dropped from the store"
         );
     }
 
