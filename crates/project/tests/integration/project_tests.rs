@@ -4631,6 +4631,206 @@ async fn test_max_active_projects_budget(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_over_budget_grace_keeps_servers_when_reactivated(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(None, Some(1), Some(30), cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir_a"), json!({ "a.rs": "" })).await;
+    fs.insert_tree(path!("/dir_b"), json!({ "b.rs": "" })).await;
+    let SuspensionFixture {
+        project: project_a,
+        lsp_store: lsp_store_a,
+        fake_rust_servers: mut fake_rust_servers_a,
+    } = suspension_fixture(fs.clone(), path!("/dir_a").as_ref(), cx).await;
+    let SuspensionFixture {
+        project: project_b,
+        lsp_store: lsp_store_b,
+        fake_rust_servers: mut fake_rust_servers_b,
+    } = suspension_fixture(fs, path!("/dir_b").as_ref(), cx).await;
+
+    project_a.update(cx, |project, cx| project.set_window_active(true, cx));
+    let (_buffer_a, _handle_a) = project_a
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir_a/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_a = fake_rust_servers_a.next().await.unwrap();
+    fake_rust_server_a
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    let (_buffer_b, _handle_b) = project_b
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir_b/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_b = fake_rust_servers_b
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project B's server should start")
+        .unwrap();
+    fake_rust_server_b
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    // Project A goes over budget but keeps its server for the grace period.
+    project_b.update(cx, |project, cx| project.set_window_active(true, cx));
+    cx.executor().advance_clock(Duration::from_secs(10));
+    cx.executor().run_until_parked();
+    assert!(
+        fake_rust_server_a
+            .try_receive_notification::<lsp::notification::Exit>()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "project A's server must keep running during the grace period"
+    );
+    assert_eq!(
+        configured_server_states(&lsp_store_a, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server_a.server.server_id()
+        )]
+    );
+
+    // Coming back within the grace period cancels A's pending suspension and puts B over
+    // budget instead, with a grace period of its own.
+    project_a.update(cx, |project, cx| project.set_window_active(true, cx));
+    cx.executor().advance_clock(Duration::from_secs(25));
+    cx.executor().run_until_parked();
+    assert!(
+        fake_rust_server_a
+            .try_receive_notification::<lsp::notification::Exit>()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "re-activating project A within the grace period must cancel its suspension"
+    );
+    assert!(
+        fake_rust_servers_a
+            .next()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "project A's server must not have been restarted"
+    );
+    assert!(
+        fake_rust_server_b
+            .try_receive_notification::<lsp::notification::Exit>()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "project B's server must keep running during B's own grace period"
+    );
+    assert_eq!(
+        configured_server_states(&lsp_store_a, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server_a.server.server_id()
+        )]
+    );
+
+    cx.executor().advance_clock(Duration::from_secs(10));
+    cx.executor().run_until_parked();
+    fake_rust_server_b
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project B's server should exit once its grace period has elapsed");
+    cx.executor().run_until_parked();
+    let states_b = configured_server_states(&lsp_store_b, cx);
+    assert_eq!(states_b.len(), 1, "{states_b:?}");
+    assert_matches!(states_b[0], ConfiguredServerState::Suspended { .. });
+    assert_eq!(
+        configured_server_states(&lsp_store_a, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server_a.server.server_id()
+        )]
+    );
+}
+
+#[gpui::test]
+async fn test_over_budget_grace_suspends_after_it_elapses(cx: &mut gpui::TestAppContext) {
+    use project::lsp_store::ConfiguredServerState;
+
+    init_test(cx);
+    set_suspension_settings(None, Some(1), Some(30), cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir_a"), json!({ "a.rs": "" })).await;
+    fs.insert_tree(path!("/dir_b"), json!({ "b.rs": "" })).await;
+    let SuspensionFixture {
+        project: project_a,
+        lsp_store: lsp_store_a,
+        fake_rust_servers: mut fake_rust_servers_a,
+    } = suspension_fixture(fs.clone(), path!("/dir_a").as_ref(), cx).await;
+    let SuspensionFixture {
+        project: project_b,
+        lsp_store: lsp_store_b,
+        fake_rust_servers: mut fake_rust_servers_b,
+    } = suspension_fixture(fs, path!("/dir_b").as_ref(), cx).await;
+
+    project_a.update(cx, |project, cx| project.set_window_active(true, cx));
+    let (_buffer_a, _handle_a) = project_a
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir_a/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_a = fake_rust_servers_a.next().await.unwrap();
+    fake_rust_server_a
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    let (_buffer_b, _handle_b) = project_b
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir_b/b.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_rust_server_b = fake_rust_servers_b
+        .next()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project B's server should start")
+        .unwrap();
+    fake_rust_server_b
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    project_b.update(cx, |project, cx| project.set_window_active(true, cx));
+    cx.executor().run_until_parked();
+    assert!(
+        fake_rust_server_a
+            .try_receive_notification::<lsp::notification::Exit>()
+            .now_or_never()
+            .flatten()
+            .is_none(),
+        "project A's server must not exit before the grace period has elapsed"
+    );
+
+    cx.executor().advance_clock(Duration::from_secs(30));
+    cx.executor().run_until_parked();
+    fake_rust_server_a
+        .receive_notification::<lsp::notification::Exit>()
+        .with_timeout(Duration::from_secs(5), &cx.executor())
+        .await
+        .expect("project A's server should exit once the grace period has elapsed");
+    cx.executor().run_until_parked();
+    let states_a = configured_server_states(&lsp_store_a, cx);
+    assert_eq!(states_a.len(), 1, "{states_a:?}");
+    assert_matches!(states_a[0], ConfiguredServerState::Suspended { .. });
+    assert_eq!(
+        configured_server_states(&lsp_store_b, cx),
+        vec![ConfiguredServerState::Running(
+            fake_rust_server_b.server.server_id()
+        )]
+    );
+}
+
+#[gpui::test]
 async fn test_projects_without_language_servers_take_no_budget_slot(cx: &mut gpui::TestAppContext) {
     use project::lsp_store::ConfiguredServerState;
 

@@ -364,6 +364,21 @@ impl LspActivityCoordinator {
         other_projects
     }
 
+    /// Returns the projects activated more recently than `lsp_store`, least recently active
+    /// first.
+    fn projects_activated_after(
+        &mut self,
+        lsp_store: &WeakEntity<LspStore>,
+    ) -> Vec<WeakEntity<LspStore>> {
+        self.prune_dropped_projects();
+        self.projects
+            .iter()
+            .skip_while(|(registered, _)| registered.entity_id() != lsp_store.entity_id())
+            .skip(1)
+            .map(|(registered, _)| registered.clone())
+            .collect()
+    }
+
     fn prune_dropped_projects(&mut self) {
         self.projects
             .retain(|(lsp_store, _)| lsp_store.upgrade().is_some());
@@ -4828,6 +4843,7 @@ pub struct LspStore {
     last_active_at: Instant,
     idle_suspension_delay: Option<Duration>,
     idle_suspend_task: Option<Task<()>>,
+    budget_suspend_task: Option<Task<()>>,
 }
 
 #[derive(Debug)]
@@ -5245,6 +5261,7 @@ impl LspStore {
             last_active_at: Instant::now(),
             idle_suspension_delay: None,
             idle_suspend_task: None,
+            budget_suspend_task: None,
         }
     }
 
@@ -5313,6 +5330,7 @@ impl LspStore {
             last_active_at: Instant::now(),
             idle_suspension_delay: None,
             idle_suspend_task: None,
+            budget_suspend_task: None,
         }
     }
 
@@ -13313,6 +13331,7 @@ impl LspStore {
             return;
         }
         self.idle_suspend_task = None;
+        self.budget_suspend_task = None;
         self.last_active_at = Instant::now();
         if self.as_local().is_none() {
             return;
@@ -13371,12 +13390,11 @@ impl LspStore {
         let other_projects = cx
             .default_global::<LspActivityCoordinator>()
             .record_activation(this, self.last_active_at);
-        let Some(max_active_projects) = ProjectSettings::get_global(cx)
-            .global_lsp_settings
-            .max_active_projects()
-        else {
+        let global_lsp_settings = &ProjectSettings::get_global(cx).global_lsp_settings;
+        let Some(max_active_projects) = global_lsp_settings.max_active_projects() else {
             return;
         };
+        let grace_period = global_lsp_settings.suspend_over_budget_after();
         let this_project_is_active = self.counts_toward_active_project_budget();
         let other_active_projects = other_projects
             .into_iter()
@@ -13389,7 +13407,55 @@ impl LspStore {
             + usize::from(this_project_is_active))
         .saturating_sub(max_active_projects);
         for lsp_store in other_active_projects.into_iter().take(projects_over_budget) {
-            lsp_store.update(cx, |lsp_store, cx| lsp_store.suspend_language_servers(cx));
+            lsp_store.update(cx, |lsp_store, cx| {
+                if grace_period.is_zero() {
+                    lsp_store.suspend_language_servers(cx);
+                } else {
+                    lsp_store.arm_budget_suspension(grace_period, cx);
+                }
+            });
+        }
+    }
+
+    fn arm_budget_suspension(&mut self, grace_period: Duration, cx: &mut Context<Self>) {
+        // A project that is already waiting keeps its earlier deadline: re-arming whenever
+        // yet another window is activated would postpone the suspension indefinitely.
+        if self.budget_suspend_task.is_some() {
+            return;
+        }
+        self.budget_suspend_task = Some(cx.spawn(async move |lsp_store, cx| {
+            cx.background_executor().timer(grace_period).await;
+            lsp_store
+                .update(cx, |lsp_store, cx| {
+                    lsp_store.budget_suspend_task.take();
+                    lsp_store.suspend_if_still_over_budget(cx);
+                })
+                .ok();
+        }));
+    }
+
+    /// Suspends this project's language servers if, now that the grace period has elapsed,
+    /// the budget is still taken up by projects that were activated more recently.
+    fn suspend_if_still_over_budget(&mut self, cx: &mut Context<Self>) {
+        let Some(max_active_projects) = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .max_active_projects()
+        else {
+            return;
+        };
+        if !self.counts_toward_active_project_budget() {
+            return;
+        }
+        let this = cx.weak_entity();
+        let more_recently_active_projects = cx
+            .default_global::<LspActivityCoordinator>()
+            .projects_activated_after(&this)
+            .into_iter()
+            .filter_map(|lsp_store| lsp_store.upgrade())
+            .filter(|lsp_store| lsp_store.read(cx).counts_toward_active_project_budget())
+            .count();
+        if more_recently_active_projects >= max_active_projects {
+            self.suspend_language_servers(cx);
         }
     }
 
