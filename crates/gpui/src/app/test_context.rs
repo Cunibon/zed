@@ -448,6 +448,18 @@ impl TestAppContext {
             .simulate_scale_factor_change(scale_factor);
     }
 
+    /// Delivers the platform's active-status callback to the given window without changing
+    /// which window the test platform considers active, the way some platforms report a
+    /// window as active even though another window is the key window.
+    pub fn simulate_window_active_status_change(
+        &self,
+        window_handle: AnyWindowHandle,
+        active: bool,
+    ) {
+        self.test_window(window_handle)
+            .simulate_active_status_change(active);
+    }
+
     /// Returns true if there's an alert dialog open.
     pub fn expect_restart(&self) -> oneshot::Receiver<(Option<PathBuf>, Vec<std::ffi::OsString>)> {
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -937,6 +949,12 @@ impl VisualTestContext {
     /// Simulates the window moving to a display with a different scale factor.
     pub fn simulate_scale_factor_change(&self, scale_factor: f32) {
         self.simulate_window_scale_factor_change(self.window, scale_factor)
+    }
+
+    /// Delivers the platform's active-status callback to this window without changing which
+    /// window the test platform considers active.
+    pub fn simulate_active_status_change(&self, active: bool) {
+        self.simulate_window_active_status_change(self.window, active)
     }
 
     /// debug_bounds returns the bounds of the element with the given selector.
