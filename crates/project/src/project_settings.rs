@@ -118,6 +118,8 @@ impl From<settings::NodeBinarySettings> for NodeBinarySettings {
     }
 }
 
+const DEFAULT_SUSPEND_OVER_BUDGET_AFTER_SECS: u64 = 30;
+
 /// Common language server settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -143,6 +145,9 @@ pub struct GlobalLspSettings {
     /// The maximum number of projects that may run language servers at the same time, or `None`
     /// for no limit.
     pub max_active_projects: Option<usize>,
+    /// How many seconds a project may stay over the `max_active_projects` budget before its
+    /// language servers are suspended. `0` or `None` suspends immediately.
+    pub suspend_over_budget_after_seconds: Option<u64>,
     pub notifications: LspNotificationSettings,
 
     /// Rules for highlighting semantic tokens.
@@ -157,6 +162,7 @@ impl Default for GlobalLspSettings {
             max_buffer_line_length: 20_000,
             suspend_after_inactive_minutes: None,
             max_active_projects: None,
+            suspend_over_budget_after_seconds: Some(DEFAULT_SUSPEND_OVER_BUDGET_AFTER_SECS),
             notifications: LspNotificationSettings::default(),
             semantic_token_rules: SemanticTokenRules::default(),
         }
@@ -183,6 +189,12 @@ impl GlobalLspSettings {
     /// time, or `None` when the number is not limited.
     pub fn max_active_projects(&self) -> Option<usize> {
         self.max_active_projects.filter(|count| *count > 0)
+    }
+
+    /// Returns how long a project may stay over the `max_active_projects` budget before its
+    /// language servers are suspended; `Duration::ZERO` suspends immediately.
+    pub fn suspend_over_budget_after(&self) -> Duration {
+        Duration::from_secs(self.suspend_over_budget_after_seconds.unwrap_or(0))
     }
 }
 
@@ -809,6 +821,10 @@ impl Settings for ProjectSettings {
                     .global_lsp_settings
                     .as_ref()
                     .and_then(|settings| settings.max_active_projects),
+                suspend_over_budget_after_seconds: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .and_then(|settings| settings.suspend_over_budget_after_seconds),
                 notifications: LspNotificationSettings {
                     dismiss_timeout_ms: content
                         .global_lsp_settings

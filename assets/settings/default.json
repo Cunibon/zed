@@ -2719,6 +2719,12 @@
     //
     // Default: null (unlimited)
     "max_active_projects": null,
+    // How many seconds a project may stay over the `max_active_projects` budget before its
+    // language servers are suspended. Switching back to its window within that time keeps them
+    // running. 0 suspends immediately.
+    //
+    // Default: 30
+    "suspend_over_budget_after_seconds": 30,
     "notifications": {
       // Timeout in milliseconds for automatically dismissing language server notifications.
       // Set to 0 to disable auto-dismiss.

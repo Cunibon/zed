@@ -4232,6 +4232,7 @@ async fn suspension_fixture(
 fn set_suspension_settings(
     suspend_after_inactive_minutes: Option<u64>,
     max_active_projects: Option<usize>,
+    suspend_over_budget_after_seconds: Option<u64>,
     cx: &mut gpui::TestAppContext,
 ) {
     cx.update(|cx| {
@@ -4240,6 +4241,7 @@ fn set_suspension_settings(
                 settings.global_lsp_settings = Some(GlobalLspSettingsContent {
                     suspend_after_inactive_minutes,
                     max_active_projects,
+                    suspend_over_budget_after_seconds,
                     ..Default::default()
                 });
             });
@@ -4266,7 +4268,7 @@ async fn test_language_servers_suspend_after_inactivity(cx: &mut gpui::TestAppCo
     use project::lsp_store::ConfiguredServerState;
 
     init_test(cx);
-    set_suspension_settings(Some(1), None, cx);
+    set_suspension_settings(Some(1), None, None, cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
@@ -4330,7 +4332,7 @@ async fn test_reactivation_cancels_pending_suspension(cx: &mut gpui::TestAppCont
     use project::lsp_store::ConfiguredServerState;
 
     init_test(cx);
-    set_suspension_settings(Some(1), None, cx);
+    set_suspension_settings(Some(1), None, None, cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
@@ -4430,7 +4432,7 @@ async fn test_user_stopped_servers_stay_stopped_across_suspend_resume(
     use project::lsp_store::ConfiguredServerState;
 
     init_test(cx);
-    set_suspension_settings(Some(1), None, cx);
+    set_suspension_settings(Some(1), None, None, cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/dir"), json!({ "a.rs": "" })).await;
@@ -4484,7 +4486,7 @@ async fn test_max_active_projects_budget(cx: &mut gpui::TestAppContext) {
     use project::lsp_store::ConfiguredServerState;
 
     init_test(cx);
-    set_suspension_settings(None, Some(1), cx);
+    set_suspension_settings(None, Some(1), Some(0), cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(path!("/dir_a"), json!({ "a.rs": "" })).await;

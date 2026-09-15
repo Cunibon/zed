@@ -280,6 +280,13 @@ pub struct GlobalLspSettingsContent {
     /// Default: `null` (unlimited)
     #[schemars(range(min = 1))]
     pub max_active_projects: Option<usize>,
+    /// How many seconds a project may stay over the `max_active_projects` budget before its
+    /// language servers are suspended. Switching back to its window within that time keeps them
+    /// running, so briefly focusing another window does not restart large servers. `0` suspends
+    /// immediately.
+    ///
+    /// Default: `30`
+    pub suspend_over_budget_after_seconds: Option<u64>,
     /// Settings for language server notifications
     pub notifications: Option<LspNotificationSettingsContent>,
     /// Rules for rendering LSP semantic tokens.

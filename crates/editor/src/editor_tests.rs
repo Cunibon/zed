@@ -39225,6 +39225,7 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
                     semantic_token_rules: None,
                     suspend_after_inactive_minutes: None,
                     max_active_projects: None,
+                    suspend_over_budget_after_seconds: None,
                 });
             });
         });
@@ -39330,6 +39331,7 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
                     semantic_token_rules: None,
                     suspend_after_inactive_minutes: None,
                     max_active_projects: None,
+                    suspend_over_budget_after_seconds: None,
                 });
             });
         });
