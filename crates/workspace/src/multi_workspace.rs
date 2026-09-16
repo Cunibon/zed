@@ -1360,6 +1360,10 @@ impl MultiWorkspace {
         });
 
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });
+        // Project activation keys on the workspace the window displays, so a switch inside the
+        // window has to re-run the decision the way a window activation does.
+        let workspace_store = workspace.read(cx).app_state().workspace_store.clone();
+        workspace_store.update(cx, |store, cx| store.schedule_project_activation(cx));
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
         cx.notify();

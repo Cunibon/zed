@@ -14371,6 +14371,57 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_switching_the_displayed_workspace_moves_project_activation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let app_state = cx.update(|cx| AppState::test(cx));
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let (window, workspace_b) =
+            add_multi_workspace_window(&project_a, &project_b, &app_state, cx);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        // The user picks workspace B in the sidebar; the window stays the platform's active one.
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace_b.clone(), None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |multi_workspace, _| {
+                assert!(multi_workspace.workspace() == &workspace_b);
+            })
+            .unwrap();
+        assert!(
+            !project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "a workspace switch must wait for the settle delay like a window activation"
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(
+            !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "the workspace that left the front of the window must deactivate its project"
+        );
+        assert!(
+            project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "the workspace brought to the front of the window must activate its project"
+        );
+    }
+
+    #[gpui::test]
     async fn test_autosave(cx: &mut gpui::TestAppContext) {
         init_test(cx);
 
