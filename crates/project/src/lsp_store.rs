@@ -13409,7 +13409,7 @@ impl LspStore {
             .default_global::<LspActivityCoordinator>()
             .record_activation(this);
         let global_lsp_settings = &ProjectSettings::get_global(cx).global_lsp_settings;
-        let Some(max_active_projects) = global_lsp_settings.max_active_projects() else {
+        let Some(max_active_projects) = global_lsp_settings.max_active_projects else {
             return;
         };
         let grace_period = global_lsp_settings.suspend_over_budget_after();
@@ -13457,7 +13457,7 @@ impl LspStore {
     fn suspend_if_still_over_budget(&mut self, cx: &mut Context<Self>) {
         let Some(max_active_projects) = ProjectSettings::get_global(cx)
             .global_lsp_settings
-            .max_active_projects()
+            .max_active_projects
         else {
             return;
         };

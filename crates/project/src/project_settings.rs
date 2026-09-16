@@ -181,14 +181,7 @@ impl GlobalLspSettings {
     /// are suspended, or `None` when suspension is disabled.
     pub fn suspend_after_inactive(&self) -> Option<Duration> {
         self.suspend_after_inactive_minutes
-            .filter(|minutes| *minutes > 0)
             .map(|minutes| Duration::from_secs(minutes.saturating_mul(60)))
-    }
-
-    /// Returns the maximum number of projects that may run language servers at the same
-    /// time, or `None` when the number is not limited.
-    pub fn max_active_projects(&self) -> Option<usize> {
-        self.max_active_projects.filter(|count| *count > 0)
     }
 
     /// Returns how long a project may stay over the `max_active_projects` budget before its
@@ -813,14 +806,18 @@ impl Settings for ProjectSettings {
                     .unwrap()
                     .max_buffer_line_length
                     .unwrap(),
+                // The schema asks for at least 1, but a user can still write `0`; treating it
+                // as `null` keeps `None` the only spelling of "disabled" for readers.
                 suspend_after_inactive_minutes: content
                     .global_lsp_settings
                     .as_ref()
-                    .and_then(|settings| settings.suspend_after_inactive_minutes),
+                    .and_then(|settings| settings.suspend_after_inactive_minutes)
+                    .filter(|minutes| *minutes > 0),
                 max_active_projects: content
                     .global_lsp_settings
                     .as_ref()
-                    .and_then(|settings| settings.max_active_projects),
+                    .and_then(|settings| settings.max_active_projects)
+                    .filter(|count| *count > 0),
                 suspend_over_budget_after_seconds: content
                     .global_lsp_settings
                     .as_ref()
