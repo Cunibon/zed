@@ -292,9 +292,9 @@ struct LanguageServerSeed {
 /// A `None` component widens the key to every worktree or every server, so
 /// `{ worktree_id: None, name: None }` covers all servers of the project.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct SuppressionKey {
-    pub worktree_id: Option<WorktreeId>,
-    pub name: Option<LanguageServerName>,
+struct SuppressionKey {
+    worktree_id: Option<WorktreeId>,
+    name: Option<LanguageServerName>,
 }
 
 impl SuppressionKey {
@@ -305,7 +305,7 @@ impl SuppressionKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SuppressionReason {
+enum SuppressionReason {
     UserStopped,
     Suspended { since: Instant },
 }
@@ -340,7 +340,7 @@ impl ConfiguredServerState {
 /// recently active first, so that activating one project can suspend the language servers of
 /// the least recently active projects when `max_active_projects` is set.
 #[derive(Default)]
-pub struct LspActivityCoordinator {
+struct LspActivityCoordinator {
     projects: Vec<WeakEntity<LspStore>>,
 }
 
@@ -13311,6 +13311,7 @@ impl LspStore {
         self.refresh_server_tree(cx);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_window_active(&self) -> bool {
         self.window_active
     }
@@ -13367,7 +13368,7 @@ impl LspStore {
 
     /// Shuts every language server down while keeping them listed as configured, so that
     /// they start again as soon as the project resumes.
-    pub fn suspend_language_servers(&mut self, reason: &str, cx: &mut Context<Self>) {
+    fn suspend_language_servers(&mut self, reason: &str, cx: &mut Context<Self>) {
         let Some(local) = self.as_local_mut() else {
             return;
         };

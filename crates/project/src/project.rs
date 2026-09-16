@@ -4185,6 +4185,7 @@ impl Project {
             .update(cx, |lsp_store, cx| lsp_store.set_window_active(active, cx));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_window_active(&self, cx: &App) -> bool {
         self.lsp_store.read(cx).is_window_active()
     }
