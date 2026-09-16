@@ -302,6 +302,16 @@ impl SuppressionKey {
         worktree_id: None,
         name: None,
     };
+
+    /// Whether this key keeps `name` stopped in `worktree_id`, where `None` asks about every
+    /// worktree.
+    fn covers(&self, worktree_id: Option<WorktreeId>, name: &LanguageServerName) -> bool {
+        let covers_worktree = match (self.worktree_id, worktree_id) {
+            (Some(key_worktree_id), Some(worktree_id)) => key_worktree_id == worktree_id,
+            _ => true,
+        };
+        covers_worktree && self.name.as_ref().is_none_or(|key_name| key_name == name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -565,39 +575,29 @@ impl LocalLspStore {
     /// A wider suppression that also covers other configured servers is narrowed down to
     /// those servers, so they stay stopped.
     fn clear_suppression(&mut self, worktree_id: Option<WorktreeId>, name: &LanguageServerName) {
-        let configured_servers = self.configured_server_keys();
-        let mut narrowed_suppressions = Vec::new();
-        self.suppressed_servers.retain(|key, reason| {
-            let covers_worktree = key.worktree_id.is_none()
-                || worktree_id.is_none()
-                || key.worktree_id == worktree_id;
-            let covers_name = key.name.as_ref().is_none_or(|key_name| key_name == name);
-            if !(covers_worktree && covers_name) {
-                return true;
+        let lifted_suppressions = self
+            .suppressed_servers
+            .extract_if(|key, _| key.covers(worktree_id, name))
+            .collect::<Vec<_>>();
+        for (configured_worktree_id, configured_name) in self.configured_server_keys() {
+            let is_cleared = configured_name == *name
+                && worktree_id.is_none_or(|worktree_id| worktree_id == configured_worktree_id);
+            if is_cleared {
+                continue;
             }
-            for (configured_worktree_id, configured_name) in &configured_servers {
-                let is_cleared = configured_name == name
-                    && worktree_id.is_none_or(|worktree_id| worktree_id == *configured_worktree_id);
-                let is_covered_by_key = key
-                    .worktree_id
-                    .is_none_or(|key_worktree_id| key_worktree_id == *configured_worktree_id)
-                    && key
-                        .name
-                        .as_ref()
-                        .is_none_or(|key_name| key_name == configured_name);
-                if is_covered_by_key && !is_cleared {
-                    narrowed_suppressions.push((
-                        SuppressionKey {
-                            worktree_id: Some(*configured_worktree_id),
-                            name: Some(configured_name.clone()),
-                        },
-                        *reason,
-                    ));
-                }
+            let still_covered = lifted_suppressions
+                .iter()
+                .find(|(key, _)| key.covers(Some(configured_worktree_id), &configured_name));
+            if let Some((_, reason)) = still_covered {
+                self.suppressed_servers.insert(
+                    SuppressionKey {
+                        worktree_id: Some(configured_worktree_id),
+                        name: Some(configured_name),
+                    },
+                    *reason,
+                );
             }
-            false
-        });
-        self.suppressed_servers.extend(narrowed_suppressions);
+        }
     }
 
     fn configured_server_state(
@@ -4835,8 +4835,9 @@ pub struct LspStore {
     buffer_reload_tasks: HashMap<BufferId, Task<anyhow::Result<()>>>,
     next_hint_id: Arc<AtomicUsize>,
     window_active: bool,
-    idle_suspension_delay: Option<Duration>,
-    idle_suspend_task: Option<Task<()>>,
+    /// The idle timer of an inactive window, with the delay it was armed for so that a
+    /// settings change can tell whether it needs re-arming.
+    idle_suspension: Option<(Duration, Task<()>)>,
     budget_suspend_task: Option<Task<()>>,
 }
 
@@ -5251,8 +5252,7 @@ impl LspStore {
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
             window_active: true,
-            idle_suspension_delay: None,
-            idle_suspend_task: None,
+            idle_suspension: None,
             budget_suspend_task: None,
         }
     }
@@ -5319,8 +5319,7 @@ impl LspStore {
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
             window_active: true,
-            idle_suspension_delay: None,
-            idle_suspend_task: None,
+            idle_suspension: None,
             budget_suspend_task: None,
         }
     }
@@ -6610,7 +6609,8 @@ impl LspStore {
         let idle_suspension_delay = ProjectSettings::get_global(cx)
             .global_lsp_settings
             .suspend_after_inactive();
-        if !self.window_active && idle_suspension_delay != self.idle_suspension_delay {
+        let armed_delay = self.idle_suspension.as_ref().map(|(delay, _)| *delay);
+        if !self.window_active && idle_suspension_delay != armed_delay {
             self.arm_idle_suspension(cx);
         }
 
@@ -13176,15 +13176,15 @@ impl LspStore {
             }
         };
 
-        let seed_name = local
-            .language_server_ids
-            .iter()
-            .find(|(_, state)| state.id == server_id)
-            .map(|(seed, _)| seed.name.clone());
         // Remove this server ID from all entries in the given worktree.
-        local
-            .language_server_ids
-            .retain(|_, state| state.id != server_id);
+        let mut seed_name = None;
+        local.language_server_ids.retain(|seed, state| {
+            let is_stopped_server = state.id == server_id;
+            if is_stopped_server {
+                seed_name = Some(seed.name.clone());
+            }
+            !is_stopped_server
+        });
         self.buffer_store.update(cx, |buffer_store, cx| {
             for buffer in buffer_store.buffers() {
                 buffer.update(cx, |buffer, cx| {
@@ -13331,12 +13331,12 @@ impl LspStore {
         if !active {
             // A window may report its deactivation more than once; re-arming the timer each
             // time would postpone the idle suspension indefinitely.
-            if was_active || self.idle_suspend_task.is_none() {
+            if was_active || self.idle_suspension.is_none() {
                 self.arm_idle_suspension(cx);
             }
             return;
         }
-        self.idle_suspend_task = None;
+        self.idle_suspension = None;
         self.budget_suspend_task = None;
         if self.as_local().is_none() {
             return;
@@ -13350,20 +13350,18 @@ impl LspStore {
             .global_lsp_settings
             .suspend_after_inactive()
             .filter(|_| self.as_local().is_some());
-        self.idle_suspension_delay = idle_suspension_delay;
-        let Some(idle_suspension_delay) = idle_suspension_delay else {
-            self.idle_suspend_task = None;
-            return;
-        };
-        self.idle_suspend_task = Some(cx.spawn(async move |lsp_store, cx| {
-            cx.background_executor().timer(idle_suspension_delay).await;
-            let reason = format!("idle for {} min", idle_suspension_delay.as_secs() / 60);
-            lsp_store
-                .update(cx, |lsp_store, cx| {
-                    lsp_store.suspend_language_servers(&reason, cx)
-                })
-                .ok();
-        }));
+        self.idle_suspension = idle_suspension_delay.map(|idle_suspension_delay| {
+            let suspend_task = cx.spawn(async move |lsp_store, cx| {
+                cx.background_executor().timer(idle_suspension_delay).await;
+                let reason = format!("idle for {} min", idle_suspension_delay.as_secs() / 60);
+                lsp_store
+                    .update(cx, |lsp_store, cx| {
+                        lsp_store.suspend_language_servers(&reason, cx)
+                    })
+                    .ok();
+            });
+            (idle_suspension_delay, suspend_task)
+        });
     }
 
     /// Shuts every language server down while keeping them listed as configured, so that

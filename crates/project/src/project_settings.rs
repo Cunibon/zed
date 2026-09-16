@@ -648,9 +648,6 @@ pub struct DiagnosticsSettings {
     /// Whether to show the project diagnostics button in the status bar.
     pub button: bool,
 
-    /// Whether or not to include warning diagnostics.
-    pub include_warnings: bool,
-
     /// The most lenient severity shown in the project and buffer diagnostics
     /// views. Never `Off`.
     pub max_severity: DiagnosticSeverity,
@@ -850,7 +847,6 @@ impl Settings for ProjectSettings {
                 .collect(),
             diagnostics: DiagnosticsSettings {
                 button: diagnostics.button.unwrap(),
-                include_warnings: diagnostics.include_warnings.unwrap(),
                 max_severity: resolve_panel_max_severity(
                     diagnostics.max_severity,
                     diagnostics.include_warnings.unwrap(),

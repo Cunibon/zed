@@ -264,9 +264,7 @@ pub struct GlobalLspSettingsContent {
     pub max_buffer_line_length: Option<u32>,
     /// How many minutes a project's window may stay inactive before its language servers are
     /// suspended. Suspended servers are shut down to free memory and start again as soon as the
-    /// window becomes active. This keeps several windows of a large monorepo (for example a
-    /// Flutter monorepo, where every window runs its own Dart analysis server) from each holding
-    /// gigabytes of memory while only one of them is in use.
+    /// window becomes active.
     ///
     /// Default: `null` (never suspend)
     #[schemars(range(min = 1))]
