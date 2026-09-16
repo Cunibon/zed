@@ -13595,7 +13595,7 @@ impl LspStore {
             futures::future::join_all(stop_tasks).await;
             lsp_store.update(cx, |lsp_store, cx| lsp_store.refresh_server_tree(cx))
         })
-        .detach();
+        .detach_and_log_err(cx);
     }
 
     pub fn restart_language_servers_for_buffers(
