@@ -4051,7 +4051,7 @@ async fn test_starting_one_server_after_stop_all_keeps_others_stopped(
 
 #[gpui::test]
 async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppContext) {
-    use project::lsp_store::{ConfiguredLanguageServer, ConfiguredServerState};
+    use project::lsp_store::{ConfiguredServerEntry, ConfiguredServerState};
 
     init_test(cx);
 
@@ -4110,7 +4110,7 @@ async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppConte
     cx.executor().run_until_parked();
     assert_eq!(
         lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers()),
-        vec![ConfiguredLanguageServer {
+        vec![ConfiguredServerEntry {
             name: LanguageServerName::new_static("rust-lsp"),
             worktree_id,
             languages: vec![LanguageName::new("Rust")],

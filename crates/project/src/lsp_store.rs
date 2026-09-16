@@ -323,7 +323,7 @@ enum SuppressionReason {
 /// A language server that the settings configure for at least one open buffer,
 /// whether or not it is currently running.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfiguredLanguageServer {
+pub struct ConfiguredServerEntry {
     pub name: LanguageServerName,
     pub worktree_id: WorktreeId,
     pub languages: Vec<LanguageName>,
@@ -12035,19 +12035,19 @@ impl LspStore {
 
     /// Lists every language server the settings configure for the registered buffers,
     /// one entry per worktree and server name, including servers that are not running.
-    pub fn configured_language_servers(&self) -> Vec<ConfiguredLanguageServer> {
+    pub fn configured_language_servers(&self) -> Vec<ConfiguredServerEntry> {
         let Some(local) = self.as_local() else {
             return Vec::new();
         };
         let mut configured_servers =
-            BTreeMap::<(WorktreeId, LanguageServerName), ConfiguredLanguageServer>::new();
+            BTreeMap::<(WorktreeId, LanguageServerName), ConfiguredServerEntry>::new();
         for (worktree_id, servers_for_worktree) in &local.lsp_tree.instances {
             for servers_for_root in servers_for_worktree.roots.values() {
                 for (name, (node, languages)) in servers_for_root {
                     let state = local.configured_server_state(*worktree_id, name, node.id());
                     let configured_server = configured_servers
                         .entry((*worktree_id, name.clone()))
-                        .or_insert_with(|| ConfiguredLanguageServer {
+                        .or_insert_with(|| ConfiguredServerEntry {
                             name: name.clone(),
                             worktree_id: *worktree_id,
                             languages: Vec::new(),

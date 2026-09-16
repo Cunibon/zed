@@ -20,7 +20,7 @@ use path::PathStyle;
 use project::{
     LspStore, LspStoreEvent, Worktree, WorktreeId,
     lsp_store::{
-        ConfiguredLanguageServer, ConfiguredServerState,
+        ConfiguredServerEntry, ConfiguredServerState,
         log_store::{GlobalLogStore, LogStore},
     },
     project_settings::ProjectSettings,
@@ -692,7 +692,7 @@ impl LanguageServerState {
     fn add_configured_server_entry(
         &self,
         menu: ContextMenu,
-        server: ConfiguredLanguageServer,
+        server: ConfiguredServerEntry,
         lsp_logs: &Entity<LogStore>,
         cx: &mut Context<Self>,
     ) -> ContextMenu {
@@ -1000,7 +1000,7 @@ enum ServerData<'a> {
         binary_status: &'a LanguageServerBinaryStatus,
     },
     Configured {
-        server: &'a ConfiguredLanguageServer,
+        server: &'a ConfiguredServerEntry,
     },
 }
 
@@ -1018,7 +1018,7 @@ enum LspMenuItem {
     },
     /// A server known from the configuration only, without a running instance to report on.
     Configured {
-        server: ConfiguredLanguageServer,
+        server: ConfiguredServerEntry,
     },
     ToggleServersButton {
         restart: bool,
@@ -1418,7 +1418,7 @@ fn generate_menu_items(
         LanguageServerName,
         HashSet<(WorktreeLabel, LanguageServerId)>,
     >,
-    configured_servers: &[(WorktreeLabel, ConfiguredLanguageServer)],
+    configured_servers: &[(WorktreeLabel, ConfiguredServerEntry)],
 ) -> Vec<LspMenuItem> {
     let preferred_worktree = |worktrees: &HashSet<(WorktreeLabel, LanguageServerId)>| {
         worktrees
@@ -1898,8 +1898,8 @@ mod tests {
         }
     }
 
-    fn configured_server(name: &str, state: ConfiguredServerState) -> ConfiguredLanguageServer {
-        ConfiguredLanguageServer {
+    fn configured_server(name: &str, state: ConfiguredServerState) -> ConfiguredServerEntry {
+        ConfiguredServerEntry {
             name: server_name(name),
             worktree_id: WorktreeId::from_usize(1),
             languages: vec![LanguageName::new("Rust")],
