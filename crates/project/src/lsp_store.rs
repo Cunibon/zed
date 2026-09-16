@@ -329,38 +329,30 @@ impl ConfiguredServerState {
     }
 }
 
-/// Tracks the local projects of this app by the time their window was last active, so that
-/// activating one project can suspend the language servers of the least recently active
-/// projects when `max_active_projects` is set.
+/// Tracks the local projects of this app in the order their windows were last active, least
+/// recently active first, so that activating one project can suspend the language servers of
+/// the least recently active projects when `max_active_projects` is set.
 #[derive(Default)]
 pub struct LspActivityCoordinator {
-    projects: Vec<(WeakEntity<LspStore>, Instant)>,
+    projects: Vec<WeakEntity<LspStore>>,
 }
 
 impl gpui::Global for LspActivityCoordinator {}
 
 impl LspActivityCoordinator {
-    fn register(&mut self, lsp_store: WeakEntity<LspStore>, active_at: Instant) {
+    fn register(&mut self, lsp_store: WeakEntity<LspStore>) {
         self.prune_dropped_projects();
-        self.projects.push((lsp_store, active_at));
+        self.projects.push(lsp_store);
     }
 
     /// Records `lsp_store` as the most recently active project and returns the other
     /// registered projects, least recently active first.
-    fn record_activation(
-        &mut self,
-        lsp_store: WeakEntity<LspStore>,
-        active_at: Instant,
-    ) -> Vec<WeakEntity<LspStore>> {
+    fn record_activation(&mut self, lsp_store: WeakEntity<LspStore>) -> Vec<WeakEntity<LspStore>> {
         self.prune_dropped_projects();
         self.projects
-            .retain(|(registered, _)| registered.entity_id() != lsp_store.entity_id());
-        let other_projects = self
-            .projects
-            .iter()
-            .map(|(registered, _)| registered.clone())
-            .collect();
-        self.projects.push((lsp_store, active_at));
+            .retain(|registered| registered.entity_id() != lsp_store.entity_id());
+        let other_projects = self.projects.clone();
+        self.projects.push(lsp_store);
         other_projects
     }
 
@@ -373,15 +365,15 @@ impl LspActivityCoordinator {
         self.prune_dropped_projects();
         self.projects
             .iter()
-            .skip_while(|(registered, _)| registered.entity_id() != lsp_store.entity_id())
+            .skip_while(|registered| registered.entity_id() != lsp_store.entity_id())
             .skip(1)
-            .map(|(registered, _)| registered.clone())
+            .cloned()
             .collect()
     }
 
     fn prune_dropped_projects(&mut self) {
         self.projects
-            .retain(|(lsp_store, _)| lsp_store.upgrade().is_some());
+            .retain(|lsp_store| lsp_store.upgrade().is_some());
     }
 }
 
@@ -4840,7 +4832,6 @@ pub struct LspStore {
     buffer_reload_tasks: HashMap<BufferId, Task<anyhow::Result<()>>>,
     next_hint_id: Arc<AtomicUsize>,
     window_active: bool,
-    last_active_at: Instant,
     idle_suspension_delay: Option<Duration>,
     idle_suspend_task: Option<Task<()>>,
     budget_suspend_task: Option<Task<()>>,
@@ -5182,8 +5173,7 @@ impl LspStore {
             .detach();
         let binary_status_task = subscribe_to_binary_statuses(&languages, cx);
         let this = cx.weak_entity();
-        cx.default_global::<LspActivityCoordinator>()
-            .register(this, Instant::now());
+        cx.default_global::<LspActivityCoordinator>().register(this);
 
         let _maintain_workspace_config = {
             let (sender, receiver) = watch::channel();
@@ -5258,7 +5248,6 @@ impl LspStore {
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
             window_active: true,
-            last_active_at: Instant::now(),
             idle_suspension_delay: None,
             idle_suspend_task: None,
             budget_suspend_task: None,
@@ -5327,7 +5316,6 @@ impl LspStore {
             _maintain_workspace_config,
             _maintain_buffer_languages: Self::maintain_buffer_languages(languages, cx),
             window_active: true,
-            last_active_at: Instant::now(),
             idle_suspension_delay: None,
             idle_suspend_task: None,
             budget_suspend_task: None,
@@ -13341,7 +13329,6 @@ impl LspStore {
         }
         self.idle_suspend_task = None;
         self.budget_suspend_task = None;
-        self.last_active_at = Instant::now();
         if self.as_local().is_none() {
             return;
         }
@@ -13420,7 +13407,7 @@ impl LspStore {
         let this = cx.weak_entity();
         let other_projects = cx
             .default_global::<LspActivityCoordinator>()
-            .record_activation(this, self.last_active_at);
+            .record_activation(this);
         let global_lsp_settings = &ProjectSettings::get_global(cx).global_lsp_settings;
         let Some(max_active_projects) = global_lsp_settings.max_active_projects() else {
             return;
