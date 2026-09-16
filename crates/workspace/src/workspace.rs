@@ -10041,30 +10041,33 @@ impl WorkspaceStore {
         }
     }
 
-    /// Decides once, for every open window, which project may resume its language servers,
-    /// after the platform has finished re-keying its windows.
+    /// Decides once, for every workspace of every open window, which project may resume its
+    /// language servers, after the platform has finished re-keying its windows.
     ///
     /// macOS reports every window as active when the application gains focus, makes several
     /// windows key one after another and delivers each window's callback asynchronously, so a
     /// per-window check can run while that window is momentarily the platform's active window.
     /// Restarting a single timer on every callback and reading the active window once for all
     /// workspaces after the burst has ended activates exactly one project, however long the
-    /// burst takes.
+    /// burst takes. A window can hold several workspaces that all share its handle, so the
+    /// decision keys on the workspace the active window displays rather than on the window.
     pub fn schedule_project_activation(&mut self, cx: &mut Context<Self>) {
         self.pending_project_activation = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
             this.update(cx, |this, cx| {
-                let active_window = cx.active_window();
+                let active_workspace = Self::active_workspace(cx);
                 let mut settled_on = None;
-                this.workspaces.retain(|(window_handle, weak_workspace)| {
+                this.workspaces.retain(|(_, weak_workspace)| {
                     let Some(workspace) = weak_workspace.upgrade() else {
                         return false;
                     };
-                    let window_active = Some(*window_handle) == active_window;
+                    let workspace_active = active_workspace
+                        .as_ref()
+                        .is_some_and(|active| active.entity_id() == workspace.entity_id());
                     workspace.update(cx, |workspace, cx| {
-                        if window_active {
+                        if workspace_active {
                             settled_on = Some(
                                 workspace
                                     .visible_worktrees(cx)
@@ -10076,7 +10079,7 @@ impl WorkspaceStore {
                             );
                         }
                         workspace.project.update(cx, |project, cx| {
-                            project.set_window_active(window_active, cx)
+                            project.set_window_active(workspace_active, cx)
                         });
                     });
                     true
@@ -10089,6 +10092,22 @@ impl WorkspaceStore {
             })
             .ok();
         }));
+    }
+
+    /// The workspace displayed by the platform's active window, if any.
+    fn active_workspace(cx: &App) -> Option<Entity<Workspace>> {
+        let active_window = cx.active_window()?;
+        if let Some(multi_workspace) = active_window.downcast::<MultiWorkspace>() {
+            // The window may have closed while the decision was pending; then nothing is active.
+            return multi_workspace
+                .read(cx)
+                .ok()
+                .map(|multi_workspace| multi_workspace.workspace().clone());
+        }
+        // Tests and any single-workspace root put a `Workspace` at the window's root.
+        active_window
+            .downcast::<Workspace>()
+            .and_then(|workspace| workspace.entity(cx).ok())
     }
 
     pub fn update_followers(
@@ -14280,6 +14299,74 @@ mod tests {
                 .read_with(cx, |store, _| store.workspaces().count()),
             1,
             "the closed workspace must be dropped from the store"
+        );
+    }
+
+    /// Opens a window that holds two workspaces on a shared `AppState`; the first one is the
+    /// workspace the window displays.
+    fn add_multi_workspace_window(
+        displayed_project: &Entity<Project>,
+        held_project: &Entity<Project>,
+        app_state: &Arc<AppState>,
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<MultiWorkspace>, Entity<Workspace>) {
+        let window = cx.add_window({
+            let project = displayed_project.clone();
+            let app_state = app_state.clone();
+            |window, cx| {
+                let workspace =
+                    cx.new(|cx| Workspace::new(Default::default(), project, app_state, window, cx));
+                MultiWorkspace::new(workspace, window, cx)
+            }
+        });
+        let held_workspace = window
+            .update(cx, {
+                let project = held_project.clone();
+                let app_state = app_state.clone();
+                |multi_workspace, window, cx| {
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(Default::default(), project, app_state, window, cx)
+                    });
+                    multi_workspace.add(workspace.clone(), window, cx);
+                    workspace
+                }
+            })
+            .unwrap();
+        (window, held_workspace)
+    }
+
+    #[gpui::test]
+    async fn test_window_activation_activates_only_the_workspace_the_window_displays(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let app_state = cx.update(|cx| AppState::test(cx));
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let (window, _workspace_b) =
+            add_multi_workspace_window(&project_a, &project_b, &app_state, cx);
+        cx.run_until_parked();
+        window
+            .read_with(cx, |multi_workspace, _| {
+                assert_eq!(multi_workspace.workspaces().count(), 2);
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(
+            project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "the project of the workspace the window displays must activate"
+        );
+        assert!(
+            !project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "a workspace the window holds in the background shares the window handle but must not activate its project"
         );
     }
 
