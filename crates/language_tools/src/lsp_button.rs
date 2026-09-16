@@ -547,19 +547,10 @@ impl LanguageServerState {
                                         // Without buffers to derive the server from (e.g. right
                                         // after it was stopped), restart every configured server
                                         // of this name directly.
-                                        let worktree_ids = lsp_store
-                                            .configured_language_servers()
-                                            .into_iter()
-                                            .filter(|server| server.name == server_name_for_restart)
-                                            .map(|server| server.worktree_id)
-                                            .collect::<Vec<_>>();
-                                        for worktree_id in worktree_ids {
-                                            lsp_store.start_language_server_for(
-                                                worktree_id,
-                                                server_name_for_restart.clone(),
-                                                cx,
-                                            );
-                                        }
+                                        lsp_store.start_language_servers_named(
+                                            server_name_for_restart.clone(),
+                                            cx,
+                                        );
                                     } else {
                                         lsp_store.restart_language_servers_for_buffers(
                                             buffers,

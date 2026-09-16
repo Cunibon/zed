@@ -13535,6 +13535,24 @@ impl LspStore {
         self.stop_language_servers_then_refresh_tree(existing_servers, cx);
     }
 
+    /// Starts (or restarts) every configured server named `name`, one per worktree the
+    /// settings configure it for, regardless of which buffers are open.
+    pub fn start_language_servers_named(
+        &mut self,
+        name: LanguageServerName,
+        cx: &mut Context<Self>,
+    ) {
+        let worktree_ids = self
+            .configured_language_servers()
+            .into_iter()
+            .filter(|server| server.name == name)
+            .map(|server| server.worktree_id)
+            .collect::<Vec<_>>();
+        for worktree_id in worktree_ids {
+            self.start_language_server_for(worktree_id, name.clone(), cx);
+        }
+    }
+
     /// Shuts down the servers rooted in worktrees that just became restricted, so that
     /// rebuilding the tree parks them on the worktree trust again until it is granted.
     fn on_worktrees_restricted(
