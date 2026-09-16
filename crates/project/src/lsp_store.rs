@@ -297,6 +297,13 @@ pub struct SuppressionKey {
     pub name: Option<LanguageServerName>,
 }
 
+impl SuppressionKey {
+    const ALL: Self = Self {
+        worktree_id: None,
+        name: None,
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SuppressionReason {
     UserStopped,
@@ -374,6 +381,18 @@ impl LspActivityCoordinator {
     fn prune_dropped_projects(&mut self) {
         self.projects
             .retain(|lsp_store| lsp_store.upgrade().is_some());
+    }
+
+    /// Keeps the projects that take one of the `max_active_projects` slots.
+    fn budgeted_projects(
+        projects: impl IntoIterator<Item = WeakEntity<LspStore>>,
+        cx: &App,
+    ) -> Vec<Entity<LspStore>> {
+        projects
+            .into_iter()
+            .filter_map(|lsp_store| lsp_store.upgrade())
+            .filter(|lsp_store| lsp_store.read(cx).counts_toward_active_project_budget())
+            .collect()
     }
 }
 
@@ -462,10 +481,7 @@ impl LocalLspStore {
         name: &LanguageServerName,
     ) -> Option<SuppressionReason> {
         [
-            SuppressionKey {
-                worktree_id: None,
-                name: None,
-            },
+            SuppressionKey::ALL,
             SuppressionKey {
                 worktree_id: Some(worktree_id),
                 name: None,
@@ -484,13 +500,7 @@ impl LocalLspStore {
     }
 
     fn suppress_all_servers(&mut self, reason: SuppressionReason) {
-        self.suppressed_servers.insert(
-            SuppressionKey {
-                worktree_id: None,
-                name: None,
-            },
-            reason,
-        );
+        self.suppressed_servers.insert(SuppressionKey::ALL, reason);
     }
 
     fn suppress_servers(
@@ -517,15 +527,11 @@ impl LocalLspStore {
     /// Servers the user stopped as a whole stay stopped instead: nothing of theirs is running,
     /// and the stop must survive the resume.
     fn suspend_all_servers(&mut self) -> bool {
-        let all_servers = SuppressionKey {
-            worktree_id: None,
-            name: None,
-        };
-        if self.suppressed_servers.contains_key(&all_servers) {
+        if self.suppressed_servers.contains_key(&SuppressionKey::ALL) {
             return false;
         }
         self.suppressed_servers.insert(
-            all_servers,
+            SuppressionKey::ALL,
             SuppressionReason::Suspended {
                 since: Instant::now(),
             },
@@ -545,10 +551,7 @@ impl LocalLspStore {
     }
 
     fn may_run_language_servers(&self) -> bool {
-        !self.suppressed_servers.contains_key(&SuppressionKey {
-            worktree_id: None,
-            name: None,
-        })
+        !self.suppressed_servers.contains_key(&SuppressionKey::ALL)
     }
 
     /// Whether this project takes one of the `max_active_projects` slots: it may run language
@@ -13297,9 +13300,14 @@ impl LspStore {
         if let Some(local) = self.as_local_mut() {
             local.suppress_all_servers(SuppressionReason::UserStopped);
         }
+        self.shutdown_all_keeping_configured(cx);
+    }
+
+    /// Shuts every language server down and rebuilds the tree, so that the servers stay
+    /// listed as configured without starting again: the suppression recorded beforehand
+    /// keeps them stopped. Shutting down alone would remove their tree nodes.
+    fn shutdown_all_keeping_configured(&mut self, cx: &mut Context<Self>) {
         self.shutdown_all_language_servers(cx).detach();
-        // Shutting down removes the servers' tree nodes; rebuilding the tree keeps the
-        // stopped servers listed as configured without starting them.
         self.refresh_server_tree(cx);
     }
 
@@ -13370,10 +13378,7 @@ impl LspStore {
             "suspending language servers of {}: {reason}",
             self.project_name_for_log(cx)
         );
-        self.shutdown_all_language_servers(cx).detach();
-        // Shutting down removes the servers' tree nodes; rebuilding the tree keeps the
-        // suspended servers listed as configured without starting them.
-        self.refresh_server_tree(cx);
+        self.shutdown_all_keeping_configured(cx);
     }
 
     fn resume_language_servers(&mut self, cx: &mut Context<Self>) {
@@ -13414,11 +13419,7 @@ impl LspStore {
         };
         let grace_period = global_lsp_settings.suspend_over_budget_after();
         let this_project_is_active = self.counts_toward_active_project_budget();
-        let other_active_projects = other_projects
-            .into_iter()
-            .filter_map(|lsp_store| lsp_store.upgrade())
-            .filter(|lsp_store| lsp_store.read(cx).counts_toward_active_project_budget())
-            .collect::<Vec<_>>();
+        let other_active_projects = LspActivityCoordinator::budgeted_projects(other_projects, cx);
         // The activating project always keeps its servers; the others give theirs up
         // least recently active first.
         let projects_over_budget = (other_active_projects.len()
@@ -13467,11 +13468,9 @@ impl LspStore {
         let this = cx.weak_entity();
         let more_recently_active_projects = cx
             .default_global::<LspActivityCoordinator>()
-            .projects_activated_after(&this)
-            .into_iter()
-            .filter_map(|lsp_store| lsp_store.upgrade())
-            .filter(|lsp_store| lsp_store.read(cx).counts_toward_active_project_budget())
-            .count();
+            .projects_activated_after(&this);
+        let more_recently_active_projects =
+            LspActivityCoordinator::budgeted_projects(more_recently_active_projects, cx).len();
         if more_recently_active_projects >= max_active_projects {
             self.suspend_language_servers("over budget", cx);
         }
