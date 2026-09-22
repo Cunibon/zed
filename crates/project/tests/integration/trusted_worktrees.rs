@@ -8,7 +8,7 @@ use serde_json::json;
 use settings::SettingsStore;
 use util::path;
 
-use crate::{FakeFs, Project};
+use crate::{FakeFs, Project, language_server_lifecycle::configured_server_states};
 
 use project::{
     lsp_store::ConfiguredServerState, trusted_worktrees::*, worktree_store::WorktreeStore,
@@ -987,16 +987,6 @@ async fn test_language_servers_follow_worktree_trust(cx: &mut TestAppContext) {
     );
     language_registry.add(rust_lang());
 
-    let configured_states = |cx: &mut TestAppContext| {
-        lsp_store.read_with(cx, |lsp_store, _| {
-            lsp_store
-                .configured_language_servers()
-                .into_iter()
-                .map(|server| server.state)
-                .collect::<Vec<_>>()
-        })
-    };
-
     let _buffer = project
         .update(cx, |project, cx| {
             project.open_local_buffer_with_lsp(path!("/root/main.rs"), cx)
@@ -1009,7 +999,7 @@ async fn test_language_servers_follow_worktree_trust(cx: &mut TestAppContext) {
         "no language server may start while the worktree is restricted"
     );
     assert_eq!(
-        configured_states(cx),
+        configured_server_states(&lsp_store, cx),
         vec![ConfiguredServerState::PendingTrust]
     );
 
@@ -1031,7 +1021,7 @@ async fn test_language_servers_follow_worktree_trust(cx: &mut TestAppContext) {
         .await;
     cx.run_until_parked();
     assert_eq!(
-        configured_states(cx),
+        configured_server_states(&lsp_store, cx),
         vec![ConfiguredServerState::Running(
             fake_server_1.server.server_id()
         )]
@@ -1055,7 +1045,7 @@ async fn test_language_servers_follow_worktree_trust(cx: &mut TestAppContext) {
         "no language server may start while the worktree is restricted again"
     );
     assert_eq!(
-        configured_states(cx),
+        configured_server_states(&lsp_store, cx),
         vec![ConfiguredServerState::PendingTrust]
     );
 
@@ -1077,7 +1067,7 @@ async fn test_language_servers_follow_worktree_trust(cx: &mut TestAppContext) {
         .await;
     cx.run_until_parked();
     assert_eq!(
-        configured_states(cx),
+        configured_server_states(&lsp_store, cx),
         vec![ConfiguredServerState::Running(
             fake_server_2.server.server_id()
         )]
