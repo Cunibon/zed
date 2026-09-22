@@ -120,15 +120,8 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
     });
 
     // Open the project diagnostics view while there are already diagnostics.
-    let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
     diagnostics
@@ -367,15 +360,8 @@ async fn test_diagnostics_with_folds(cx: &mut TestAppContext) {
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
 
-    let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
     // Two language servers start updating diagnostics
@@ -419,9 +405,7 @@ async fn test_diagnostics_with_folds(cx: &mut TestAppContext) {
     });
 
     // Only the first language server's diagnostics are shown.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.executor().run_until_parked();
+    settle_diagnostics(cx);
     editor.update_in(cx, |editor, window, cx| {
         editor.fold_ranges(vec![Point::new(0, 0)..Point::new(3, 0)], false, window, cx);
     });
@@ -483,15 +467,8 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
 
-    let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
     // Two language servers start updating diagnostics
@@ -525,9 +502,7 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     });
 
     // Only the first language server's diagnostics are shown.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.executor().run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -565,9 +540,7 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     });
 
     // Both language server's diagnostics are shown.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.executor().run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -622,9 +595,7 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     });
 
     // Only the first language server's diagnostics are updated.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.executor().run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -664,9 +635,7 @@ async fn test_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     });
 
     // Both language servers' diagnostics are updated.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.executor().run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -701,15 +670,8 @@ async fn test_random_diagnostics_blocks(cx: &mut TestAppContext, mut rng: StdRng
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
 
-    let mutated_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let mutated_diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
 
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.add_item_to_center(Box::new(mutated_diagnostics.clone()), window, cx);
@@ -803,10 +765,7 @@ async fn test_random_diagnostics_blocks(cx: &mut TestAppContext, mut rng: StdRng
                         )
                         .unwrap()
                 });
-                cx.executor()
-                    .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-
-                cx.run_until_parked();
+                settle_diagnostics(cx);
             }
         }
     }
@@ -817,18 +776,9 @@ async fn test_random_diagnostics_blocks(cx: &mut TestAppContext, mut rng: StdRng
     });
 
     log::info!("constructing reference diagnostics view");
-    let reference_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    let reference_diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
+    settle_diagnostics(cx);
 
     let mutated_excerpts =
         editor_content_with_blocks(&mutated_diagnostics.update(cx, |d, _| d.editor.clone()), cx);
@@ -888,15 +838,8 @@ async fn test_random_diagnostics_with_inlays(cx: &mut TestAppContext, mut rng: S
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
 
-    let mutated_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let mutated_diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
 
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.add_item_to_center(Box::new(mutated_diagnostics.clone()), window, cx);
@@ -1017,10 +960,7 @@ async fn test_random_diagnostics_with_inlays(cx: &mut TestAppContext, mut rng: S
                         )
                         .unwrap()
                 });
-                cx.executor()
-                    .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-
-                cx.run_until_parked();
+                settle_diagnostics(cx);
             }
         }
     }
@@ -1030,9 +970,7 @@ async fn test_random_diagnostics_with_inlays(cx: &mut TestAppContext, mut rng: S
         diagnostics.update_stale_excerpts(window, cx)
     });
 
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 }
 
 #[gpui::test]
@@ -1577,15 +1515,8 @@ async fn test_diagnostics_views_update_when_only_markdown_changes(cx: &mut TestA
         })
         .unwrap();
 
-    let project_diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let project_diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
     let project_editor =
         project_diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
     let buffer_diagnostics = window.build_entity(cx, |window, cx| {
@@ -1604,9 +1535,7 @@ async fn test_diagnostics_views_update_when_only_markdown_changes(cx: &mut TestA
     project_diagnostics
         .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
         .await;
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 
     let expected_content = indoc! {"
         § main.rs
@@ -1649,9 +1578,7 @@ async fn test_diagnostics_views_update_when_only_markdown_changes(cx: &mut TestA
     project_diagnostics
         .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
         .await;
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 
     let expected_content = indoc! {"
         § main.rs
@@ -1823,15 +1750,8 @@ async fn test_diagnostics_with_code(cx: &mut TestAppContext) {
     });
 
     // Open the project diagnostics view
-    let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Warning,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
 
     diagnostics
@@ -1981,57 +1901,10 @@ async fn go_to_diagnostic_with_severity(cx: &mut TestAppContext) {
 async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     init_test(cx);
 
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        path!("/test"),
-        json!({
-            "main.rs": "
-                fn main() {
-                    error();
-                    warning();
-                    info();
-                    hint();
-                }
-            "
-            .unindent(),
-        }),
-    )
-    .await;
+    let (project, workspace, mut cx) = four_severity_project(cx).await;
+    let cx = &mut cx;
 
-    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
-    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let workspace = window
-        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-        .unwrap();
-
-    lsp_store.update(cx, |lsp_store, cx| {
-        lsp_store
-            .update_diagnostics(
-                LanguageServerId(0),
-                lsp::PublishDiagnosticsParams {
-                    uri: lsp::Uri::from_file_path(path!("/test/main.rs")).unwrap(),
-                    version: None,
-                    diagnostics: four_severity_diagnostics(),
-                },
-                None,
-                DiagnosticSourceKind::Pushed,
-                &[],
-                cx,
-            )
-            .unwrap();
-    });
-
-    let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Error,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let diagnostics = open_project_diagnostics(DiagnosticSeverity::Error, &project, &workspace, cx);
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.add_item_to_active_pane(Box::new(diagnostics.clone()), None, true, window, cx)
     });
@@ -2093,10 +1966,7 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
             });
         });
     });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
         errors_warnings_and_info
@@ -2110,27 +1980,18 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     diagnostics.update_in(cx, |diagnostics, window, cx| {
         diagnostics.toggle_warnings(&ToggleWarnings, window, cx)
     });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
 
     diagnostics.update_in(cx, |diagnostics, window, cx| {
         diagnostics.toggle_warnings(&ToggleWarnings, window, cx)
     });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_and_warnings);
 
     // Any level can be selected directly.
     cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Hint, cx));
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), everything);
     assert_eq!(
         editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
@@ -2140,10 +2001,7 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     // The toolbar reads the threshold through the `DiagnosticsToolbarEditor` trait.
     let toolbar_editor: Arc<dyn DiagnosticsToolbarEditor> = Arc::new(diagnostics.downgrade());
     cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Warning, cx));
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     assert_eq!(
         cx.update(|_, cx| toolbar_editor.max_severity(cx)),
         DiagnosticSeverity::Warning
@@ -2155,9 +2013,7 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     cx.dispatch_action(SetMaxSeverity {
         severity: DiagnosticSeverityContent::Off,
     });
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
 }
 
@@ -2165,57 +2021,10 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
 async fn test_project_diagnostics_threshold_survives_settings_changes(cx: &mut TestAppContext) {
     init_test(cx);
 
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        path!("/test"),
-        json!({
-            "main.rs": "
-                fn main() {
-                    error();
-                    warning();
-                    info();
-                    hint();
-                }
-            "
-            .unindent(),
-        }),
-    )
-    .await;
+    let (project, workspace, mut cx) = four_severity_project(cx).await;
+    let cx = &mut cx;
 
-    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
-    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let workspace = window
-        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-        .unwrap();
-
-    lsp_store.update(cx, |lsp_store, cx| {
-        lsp_store
-            .update_diagnostics(
-                LanguageServerId(0),
-                lsp::PublishDiagnosticsParams {
-                    uri: lsp::Uri::from_file_path(path!("/test/main.rs")).unwrap(),
-                    version: None,
-                    diagnostics: four_severity_diagnostics(),
-                },
-                None,
-                DiagnosticSourceKind::Pushed,
-                &[],
-                cx,
-            )
-            .unwrap();
-    });
-
-    let diagnostics = window.build_entity(cx, |window, cx| {
-        ProjectDiagnosticsEditor::new(
-            DiagnosticSeverity::Info,
-            project.clone(),
-            workspace.downgrade(),
-            window,
-            cx,
-        )
-    });
+    let diagnostics = open_project_diagnostics(DiagnosticSeverity::Info, &project, &workspace, cx);
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
     diagnostics
         .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
@@ -2248,10 +2057,7 @@ async fn test_project_diagnostics_threshold_survives_settings_changes(cx: &mut T
             });
         });
     });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     assert_eq!(
         editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
         DiagnosticSeverity::Info
@@ -2269,10 +2075,7 @@ async fn test_project_diagnostics_threshold_survives_settings_changes(cx: &mut T
             });
         });
     });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
     assert_eq!(
         editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
         DiagnosticSeverity::Info
@@ -2281,6 +2084,81 @@ async fn test_project_diagnostics_threshold_survives_settings_changes(cx: &mut T
         editor_content_with_blocks(&editor, cx),
         errors_warnings_and_info
     );
+}
+
+fn settle_diagnostics(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    cx.run_until_parked();
+}
+
+fn open_project_diagnostics(
+    max_severity: DiagnosticSeverity,
+    project: &Entity<Project>,
+    workspace: &Entity<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Entity<ProjectDiagnosticsEditor> {
+    cx.update(|window, cx| {
+        cx.new(|cx| {
+            ProjectDiagnosticsEditor::new(
+                max_severity,
+                project.clone(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        })
+    })
+}
+
+async fn four_severity_project(
+    cx: &mut TestAppContext,
+) -> (Entity<Project>, Entity<Workspace>, VisualTestContext) {
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/test"),
+        json!({
+            "main.rs": "
+                fn main() {
+                    error();
+                    warning();
+                    info();
+                    hint();
+                }
+            "
+            .unindent(),
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let workspace = window
+        .read_with(&cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        })
+        .unwrap();
+
+    lsp_store.update(&mut cx, |lsp_store, cx| {
+        lsp_store
+            .update_diagnostics(
+                LanguageServerId(0),
+                lsp::PublishDiagnosticsParams {
+                    uri: lsp::Uri::from_file_path(path!("/test/main.rs")).unwrap(),
+                    version: None,
+                    diagnostics: four_severity_diagnostics(),
+                },
+                None,
+                DiagnosticSourceKind::Pushed,
+                &[],
+                cx,
+            )
+            .unwrap();
+    });
+    (project, workspace, cx)
 }
 
 fn four_severity_diagnostics() -> Vec<lsp::Diagnostic> {
@@ -2491,8 +2369,7 @@ async fn test_buffer_diagnostics(cx: &mut TestAppContext) {
     // Since the excerpt updates is handled by a background task, we need to
     // wait a little bit to ensure that the buffer diagnostic's editor content
     // is rendered.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -2639,8 +2516,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     // Since the excerpt updates is handled by a background task, we need to
     // wait a little bit to ensure that the buffer diagnostic's editor content
     // is rendered.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -2666,10 +2542,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
 
     // Warnings join the errors once the threshold is lowered.
     cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Warning, cx));
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -2698,10 +2571,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     );
 
     cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Info, cx));
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -2730,10 +2600,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     );
 
     cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Hint, cx));
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -2770,10 +2637,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
             cx,
         )
     });
-    cx.run_until_parked();
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
-    cx.run_until_parked();
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
@@ -2910,8 +2774,7 @@ async fn test_buffer_diagnostics_multiple_servers(cx: &mut TestAppContext) {
     // Since the excerpt updates is handled by a background task, we need to
     // wait a little bit to ensure that the buffer diagnostic's editor content
     // is rendered.
-    cx.executor()
-        .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
+    settle_diagnostics(cx);
 
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
