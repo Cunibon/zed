@@ -2126,9 +2126,7 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_and_warnings);
 
     // Any level can be selected directly.
-    diagnostics.update(cx, |diagnostics, cx| {
-        diagnostics.set_max_severity(DiagnosticSeverity::Hint, cx)
-    });
+    cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Hint, cx));
     cx.run_until_parked();
     cx.executor()
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
@@ -2139,9 +2137,9 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
         DiagnosticSeverity::Hint
     );
 
-    // The toolbar drives the threshold through the `DiagnosticsToolbarEditor` trait.
+    // The toolbar reads the threshold through the `DiagnosticsToolbarEditor` trait.
     let toolbar_editor: Arc<dyn DiagnosticsToolbarEditor> = Arc::new(diagnostics.downgrade());
-    cx.update(|_, cx| toolbar_editor.set_max_severity(DiagnosticSeverity::Warning, cx));
+    cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Warning, cx));
     cx.run_until_parked();
     cx.executor()
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
@@ -2667,9 +2665,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     );
 
     // Warnings join the errors once the threshold is lowered.
-    buffer_diagnostics.update(cx, |buffer_diagnostics, cx| {
-        buffer_diagnostics.set_max_severity(DiagnosticSeverity::Warning, cx)
-    });
+    cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Warning, cx));
     cx.run_until_parked();
     cx.executor()
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
@@ -2701,9 +2697,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
         }
     );
 
-    buffer_diagnostics.update(cx, |buffer_diagnostics, cx| {
-        buffer_diagnostics.set_max_severity(DiagnosticSeverity::Info, cx)
-    });
+    cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Info, cx));
     cx.run_until_parked();
     cx.executor()
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
@@ -2735,9 +2729,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
         }
     );
 
-    buffer_diagnostics.update(cx, |buffer_diagnostics, cx| {
-        buffer_diagnostics.set_max_severity(DiagnosticSeverity::Hint, cx)
-    });
+    cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Hint, cx));
     cx.run_until_parked();
     cx.executor()
         .advance_clock(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10));
@@ -2769,8 +2761,8 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
         }
     );
 
-    buffer_diagnostics.update_in(cx, |buffer_diagnostics, window, cx| {
-        buffer_diagnostics.handle_set_max_severity(
+    cx.update(|window, cx| {
+        handle_set_max_severity(
             &SetMaxSeverity {
                 severity: DiagnosticSeverityContent::Error,
             },

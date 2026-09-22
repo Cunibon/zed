@@ -1,5 +1,6 @@
 use crate::{
     BufferDiagnosticsEditor, ProjectDiagnosticsEditor, SetMaxSeverity, ToggleDiagnosticsRefresh,
+    set_panel_max_severity,
 };
 use agent_settings::AgentSettings;
 use gpui::{Action as _, Context, EventEmitter, ParentElement, Render, Window};
@@ -20,8 +21,6 @@ pub struct ToolbarControls {
 pub(crate) trait DiagnosticsToolbarEditor: Send + Sync {
     /// The most lenient severity the diagnostics editor currently shows.
     fn max_severity(&self, cx: &App) -> DiagnosticSeverity;
-    /// Changes the most lenient severity the diagnostics editor shows.
-    fn set_max_severity(&self, max_severity: DiagnosticSeverity, cx: &mut App);
     /// Indicates whether the diagnostics editor is currently updating the
     /// diagnostics.
     fn is_updating(&self, cx: &App) -> bool;
@@ -131,7 +130,6 @@ impl Render for ToolbarControls {
                         let max_severity = editor.max_severity(cx);
                         Some(ContextMenu::build(window, cx, |mut menu, _, _| {
                             for (label, severity) in MAX_SEVERITY_ENTRIES {
-                                let editor = editor.clone();
                                 menu = menu.toggleable_entry(
                                     label,
                                     max_severity >= severity,
@@ -143,7 +141,7 @@ impl Render for ToolbarControls {
                                         .boxed_clone(),
                                     ),
                                     move |_, cx| {
-                                        editor.set_max_severity(
+                                        set_panel_max_severity(
                                             clicked_max_severity(max_severity, severity),
                                             cx,
                                         )
