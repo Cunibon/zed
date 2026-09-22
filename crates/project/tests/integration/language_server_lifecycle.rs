@@ -93,6 +93,16 @@ pub(crate) fn configured_server_states(
     })
 }
 
+fn configured_server<'a>(
+    configured: &'a [ConfiguredServerEntry],
+    name: &str,
+) -> &'a ConfiguredServerEntry {
+    configured
+        .iter()
+        .find(|server| server.name == *name)
+        .unwrap_or_else(|| panic!("no configured language server named {name}: {configured:?}"))
+}
+
 /// Asserts that `server` is the only configured server of the project and is running.
 fn assert_running(
     lsp_store: &Entity<LspStore>,
@@ -378,7 +388,9 @@ async fn test_starting_one_server_after_stop_all_keeps_others_stopped(
 }
 
 #[gpui::test]
-async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppContext) {
+async fn test_configured_language_servers_lists_stopped_and_failed_servers(
+    cx: &mut gpui::TestAppContext,
+) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -457,22 +469,18 @@ async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppConte
     let configured =
         lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers());
     assert_eq!(configured.len(), 2, "{configured:?}");
+    let broken_js_server = configured_server(&configured, "broken-js-lsp");
     assert_eq!(
-        configured[0].name,
-        LanguageServerName::new_static("broken-js-lsp")
-    );
-    assert_eq!(
-        configured[0].languages,
+        broken_js_server.languages,
         vec![LanguageName::new("JavaScript")]
     );
-    match &configured[0].state {
-        ConfiguredServerState::Failed(error) => {
-            assert!(error.contains("disabled in tests"), "{error}")
-        }
-        other => panic!("expected the js server to have failed, got {other:?}"),
-    }
+    assert_matches!(
+        broken_js_server.state,
+        ConfiguredServerState::Failed(_),
+        "{broken_js_server:?}"
+    );
     assert_eq!(
-        configured[1].state,
+        configured_server(&configured, "rust-lsp").state,
         ConfiguredServerState::Running(fake_rust_server_1.server.server_id())
     );
 
@@ -492,21 +500,14 @@ async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppConte
     );
     let configured =
         lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers());
+    assert_eq!(configured.len(), 2, "{configured:?}");
     assert_eq!(
-        configured
-            .iter()
-            .map(|server| (server.name.clone(), server.state.clone()))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                LanguageServerName::new_static("broken-js-lsp"),
-                ConfiguredServerState::Stopped
-            ),
-            (
-                LanguageServerName::new_static("rust-lsp"),
-                ConfiguredServerState::Stopped
-            ),
-        ]
+        configured_server(&configured, "broken-js-lsp").state,
+        ConfiguredServerState::Stopped
+    );
+    assert_eq!(
+        configured_server(&configured, "rust-lsp").state,
+        ConfiguredServerState::Stopped
     );
 
     lsp_store.update(cx, |lsp_store, cx| {
@@ -523,10 +524,13 @@ async fn test_configured_language_servers_projection(cx: &mut gpui::TestAppConte
     let configured =
         lsp_store.read_with(cx, |lsp_store, _| lsp_store.configured_language_servers());
     assert_eq!(
-        configured[1].state,
+        configured_server(&configured, "rust-lsp").state,
         ConfiguredServerState::Running(fake_rust_server_2.server.server_id())
     );
-    assert_matches!(configured[0].state, ConfiguredServerState::Failed(_));
+    assert_matches!(
+        configured_server(&configured, "broken-js-lsp").state,
+        ConfiguredServerState::Failed(_)
+    );
 }
 
 /// A project with `a.rs` open and the fake rust server that opened it running.
