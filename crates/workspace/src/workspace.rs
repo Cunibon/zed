@@ -14310,6 +14310,56 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_window_deactivation_reaches_the_projects_of_held_workspaces(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let app_state = cx.update(|cx| AppState::test(cx));
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let (window, workspace_b) =
+            add_multi_workspace_window(&project_a, &project_b, &app_state, cx);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        // Workspace B moves to the front before the switch has settled, so the window now
+        // holds workspace A in the background while A's project is still active.
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace_b.clone(), None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |multi_workspace, _| {
+                assert_eq!(multi_workspace.workspaces().count(), 2);
+                assert!(multi_workspace.workspace() == &workspace_b);
+            })
+            .unwrap();
+        assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
+
+        cx.simulate_window_active_status_change(window.into(), false);
+        cx.run_until_parked();
+        assert!(
+            !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "deactivation must reach a workspace the window holds in the background without waiting for the settle delay"
+        );
+        assert!(
+            !project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
+            "deactivation must reach the workspace the window displays without waiting for the settle delay"
+        );
+    }
+
+    #[gpui::test]
     async fn test_autosave(cx: &mut gpui::TestAppContext) {
         init_test(cx);
 
