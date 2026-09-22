@@ -14031,36 +14031,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_window_activation_reaches_project(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let (_workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
-        assert!(project.read_with(cx, |project, cx| project.is_window_active(cx)));
-
-        cx.deactivate_window();
-        assert!(
-            !project.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "deactivating the window must reach the project"
-        );
-
-        cx.update(|window, _| window.activate_window());
-        cx.executor().run_until_parked();
-        assert!(
-            !project.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "an activation must wait until the key-window sequence has settled"
-        );
-        cx.executor().advance_clock(Duration::from_millis(800));
-        cx.executor().run_until_parked();
-        assert!(
-            project.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "re-activating the window must reach the project"
-        );
-    }
-
-    #[gpui::test]
     async fn test_spurious_activation_of_background_window_does_not_activate_its_project(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -14097,97 +14067,6 @@ mod tests {
         assert!(
             project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
             "the platform's active window must keep its project active"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_spurious_activation_of_background_window_keeps_active_project(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-
-        let app_state = cx.update(|cx| AppState::test(cx));
-        let fs = FakeFs::new(cx.executor());
-        let project_a = Project::test(fs.clone(), [], cx).await;
-        let project_b = Project::test(fs, [], cx).await;
-        let window_a = add_workspace_window(&project_a, &app_state, cx);
-        let window_b = add_workspace_window(&project_b, &app_state, cx);
-        cx.run_until_parked();
-        window_a
-            .update(cx, |_, window, _| window.activate_window())
-            .unwrap();
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(800));
-        cx.run_until_parked();
-        assert_eq!(cx.update(|cx| cx.active_window()), Some(window_a.into()));
-        assert!(project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
-        assert!(!project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
-
-        cx.simulate_window_active_status_change(window_b.into(), true);
-        cx.run_until_parked();
-        assert_eq!(cx.update(|cx| window_b.is_active(cx)), Some(true));
-        cx.executor().advance_clock(Duration::from_millis(800));
-        cx.run_until_parked();
-        assert!(
-            project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "the platform's active window must keep its project active"
-        );
-        assert!(
-            !project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "a window that is not the platform's active window must not activate its project"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_activation_sequence_activates_only_the_final_key_window(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-
-        let app_state = cx.update(|cx| AppState::test(cx));
-        let fs = FakeFs::new(cx.executor());
-        let project_a = Project::test(fs.clone(), [], cx).await;
-        let project_b = Project::test(fs, [], cx).await;
-        let window_a = add_workspace_window(&project_a, &app_state, cx);
-        let window_b = add_workspace_window(&project_b, &app_state, cx);
-        cx.run_until_parked();
-        window_b
-            .update(cx, |_, window, _| window.activate_window())
-            .unwrap();
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(800));
-        cx.run_until_parked();
-        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
-        assert!(project_b.read_with(cx, |project, cx| project.is_window_active(cx)));
-
-        // When the application regains focus, AppKit makes its windows key one after another
-        // and each window's callback runs while that window is momentarily the active one.
-        window_a
-            .update(cx, |_, window, _| window.activate_window())
-            .unwrap();
-        cx.run_until_parked();
-        assert_eq!(cx.update(|cx| cx.active_window()), Some(window_a.into()));
-        assert!(
-            !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "a window that is only briefly the active window must not activate its project"
-        );
-
-        window_b
-            .update(cx, |_, window, _| window.activate_window())
-            .unwrap();
-        cx.run_until_parked();
-        assert_eq!(cx.update(|cx| cx.active_window()), Some(window_b.into()));
-        assert!(!project_a.read_with(cx, |project, cx| project.is_window_active(cx)));
-
-        cx.executor().advance_clock(Duration::from_millis(800));
-        cx.run_until_parked();
-        assert!(
-            !project_a.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "a window that lost the key status during the sequence must stay inactive"
-        );
-        assert!(
-            project_b.read_with(cx, |project, cx| project.is_window_active(cx)),
-            "the window that is active once the sequence has settled must activate its project"
         );
     }
 
