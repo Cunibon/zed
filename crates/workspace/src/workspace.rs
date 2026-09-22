@@ -1372,6 +1372,14 @@ pub struct WorkspaceStore {
     _subscriptions: Vec<client::Subscription>,
 }
 
+pub enum WorkspaceStoreEvent {
+    /// The outcome of `WorkspaceStore::schedule_project_activation`: only the project of
+    /// `active_workspace` may run its language servers.
+    ProjectActivationDecided { active_workspace: Option<EntityId> },
+}
+
+impl EventEmitter<WorkspaceStoreEvent> for WorkspaceStore {}
+
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub enum CollaboratorId {
     PeerId(PeerId),
@@ -2012,6 +2020,13 @@ impl Workspace {
 
         let subscriptions = vec![
             cx.observe_window_activation(window, Self::on_window_activation_changed),
+            cx.subscribe(&app_state.workspace_store, |this, _, event, cx| {
+                let WorkspaceStoreEvent::ProjectActivationDecided { active_workspace } = event;
+                let workspace_active = *active_workspace == Some(cx.entity_id());
+                this.project.update(cx, |project, cx| {
+                    project.set_window_active(workspace_active, cx)
+                });
+            }),
             cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
                 // Settings can only affect the title through these two values,
                 // so skip the recomputation when they are unchanged.
@@ -10056,7 +10071,7 @@ impl WorkspaceStore {
     /// workspaces after the burst has ended activates exactly one project, however long the
     /// burst takes. A window can hold several workspaces that all share its handle, so the
     /// decision keys on the workspace the active window displays rather than on the window.
-    pub fn schedule_project_activation(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn schedule_project_activation(&mut self, cx: &mut Context<Self>) {
         self.project_activation_debouncer.fire_new(
             PROJECT_ACTIVATION_SETTLE_DELAY,
             cx,
@@ -10067,11 +10082,9 @@ impl WorkspaceStore {
         );
     }
 
-    /// Activates the project of the workspace the platform's active window displays and
-    /// deactivates every other project.
+    /// Names the workspace the platform's active window displays; every workspace applies
+    /// the decision to its own project (see `Workspace::new`).
     fn decide_project_activation(&mut self, cx: &mut Context<Self>) {
-        self.workspaces
-            .retain(|(_, weak_workspace)| weak_workspace.upgrade().is_some());
         let active_workspace = Self::active_workspace(cx);
         let settled_on = active_workspace.as_ref().map(|workspace| {
             workspace
@@ -10081,20 +10094,9 @@ impl WorkspaceStore {
                 .map(|worktree| worktree.read(cx).abs_path().display().to_string())
                 .unwrap_or_else(|| "a window without worktrees".to_string())
         });
-        for workspace in self
-            .workspaces
-            .iter()
-            .filter_map(|(_, weak_workspace)| weak_workspace.upgrade())
-        {
-            let workspace_active = active_workspace
-                .as_ref()
-                .is_some_and(|active| active.entity_id() == workspace.entity_id());
-            workspace.update(cx, |workspace, cx| {
-                workspace.project.update(cx, |project, cx| {
-                    project.set_window_active(workspace_active, cx)
-                });
-            });
-        }
+        cx.emit(WorkspaceStoreEvent::ProjectActivationDecided {
+            active_workspace: active_workspace.map(|workspace| workspace.entity_id()),
+        });
         log::info!(
             "project activation settled on {}",
             settled_on.as_deref().unwrap_or("no window")
