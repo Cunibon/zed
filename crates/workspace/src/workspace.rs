@@ -99,6 +99,7 @@ use postage::stream::Stream;
 use project::{
     DirectoryLister, Project, ProjectEntryId, ProjectPath, ResolvedPath, Worktree, WorktreeId,
     WorktreeSettings,
+    debounced_delay::DebouncedDelay,
     debugger::{breakpoint_store::BreakpointStoreEvent, session::ThreadStatus},
     git_store::{GitStoreEvent, RepositoryEvent},
     project_settings::ProjectSettings,
@@ -1360,10 +1361,14 @@ pub struct PreviousWorkspaceState {
     pub focused_dock: Option<DockPosition>,
 }
 
+/// How long the platform's key-window burst has to be quiet before the `WorkspaceStore`
+/// decides which project is active (see `WorkspaceStore::schedule_project_activation`).
+pub(crate) const PROJECT_ACTIVATION_SETTLE_DELAY: Duration = Duration::from_millis(750);
+
 pub struct WorkspaceStore {
     workspaces: HashSet<(gpui::AnyWindowHandle, WeakEntity<Workspace>)>,
     client: Arc<Client>,
-    pending_project_activation: Option<Task<()>>,
+    project_activation_debouncer: DebouncedDelay<Self>,
     _subscriptions: Vec<client::Subscription>,
 }
 
@@ -10037,7 +10042,7 @@ impl WorkspaceStore {
                 client.add_message_handler(cx.weak_entity(), Self::handle_update_followers),
             ],
             client,
-            pending_project_activation: None,
+            project_activation_debouncer: DebouncedDelay::new(),
         }
     }
 
@@ -10052,46 +10057,48 @@ impl WorkspaceStore {
     /// burst takes. A window can hold several workspaces that all share its handle, so the
     /// decision keys on the workspace the active window displays rather than on the window.
     pub fn schedule_project_activation(&mut self, cx: &mut Context<Self>) {
-        self.pending_project_activation = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            this.update(cx, |this, cx| {
-                let active_workspace = Self::active_workspace(cx);
-                let mut settled_on = None;
-                this.workspaces.retain(|(_, weak_workspace)| {
-                    let Some(workspace) = weak_workspace.upgrade() else {
-                        return false;
-                    };
-                    let workspace_active = active_workspace
-                        .as_ref()
-                        .is_some_and(|active| active.entity_id() == workspace.entity_id());
-                    workspace.update(cx, |workspace, cx| {
-                        if workspace_active {
-                            settled_on = Some(
-                                workspace
-                                    .visible_worktrees(cx)
-                                    .next()
-                                    .map(|worktree| {
-                                        worktree.read(cx).abs_path().display().to_string()
-                                    })
-                                    .unwrap_or_else(|| "a window without worktrees".to_string()),
-                            );
-                        }
-                        workspace.project.update(cx, |project, cx| {
-                            project.set_window_active(workspace_active, cx)
-                        });
-                    });
-                    true
+        self.project_activation_debouncer.fire_new(
+            PROJECT_ACTIVATION_SETTLE_DELAY,
+            cx,
+            |this, cx| {
+                this.decide_project_activation(cx);
+                Task::ready(())
+            },
+        );
+    }
+
+    /// Activates the project of the workspace the platform's active window displays and
+    /// deactivates every other project.
+    fn decide_project_activation(&mut self, cx: &mut Context<Self>) {
+        self.workspaces
+            .retain(|(_, weak_workspace)| weak_workspace.upgrade().is_some());
+        let active_workspace = Self::active_workspace(cx);
+        let settled_on = active_workspace.as_ref().map(|workspace| {
+            workspace
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).abs_path().display().to_string())
+                .unwrap_or_else(|| "a window without worktrees".to_string())
+        });
+        for workspace in self
+            .workspaces
+            .iter()
+            .filter_map(|(_, weak_workspace)| weak_workspace.upgrade())
+        {
+            let workspace_active = active_workspace
+                .as_ref()
+                .is_some_and(|active| active.entity_id() == workspace.entity_id());
+            workspace.update(cx, |workspace, cx| {
+                workspace.project.update(cx, |project, cx| {
+                    project.set_window_active(workspace_active, cx)
                 });
-                log::info!(
-                    "project activation settled on {}",
-                    settled_on.as_deref().unwrap_or("no window")
-                );
-                this.pending_project_activation.take();
-            })
-            .ok();
-        }));
+            });
+        }
+        log::info!(
+            "project activation settled on {}",
+            settled_on.as_deref().unwrap_or("no window")
+        );
     }
 
     /// The workspace displayed by the platform's active window, if any.
