@@ -73,15 +73,6 @@ pub struct SetMaxSeverity {
     pub severity: DiagnosticSeverityContent,
 }
 
-/// `Off` would leave a diagnostics view permanently empty, so it is clamped
-/// to the strictest useful threshold.
-pub(crate) fn panel_max_severity(severity: DiagnosticSeverityContent) -> DiagnosticSeverity {
-    match DiagnosticSeverity::from(severity) {
-        DiagnosticSeverity::Off => DiagnosticSeverity::Error,
-        severity => severity,
-    }
-}
-
 /// Shared by every open diagnostics view so that changing the threshold in
 /// one view changes it in all of them.
 #[derive(Clone, Copy)]
@@ -481,7 +472,10 @@ impl ProjectDiagnosticsEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_max_severity(panel_max_severity(action.severity), cx);
+        self.set_max_severity(
+            DiagnosticSeverity::from(action.severity).clamp_for_panel(),
+            cx,
+        );
     }
 
     pub(crate) fn set_max_severity(

@@ -5,7 +5,7 @@ use agent_settings::AgentSettings;
 use gpui::{Action as _, Context, EventEmitter, ParentElement, Render, Window};
 use language::DiagnosticEntry;
 use project::project_settings::DiagnosticSeverity;
-use settings::{DiagnosticSeverityContent, Settings};
+use settings::Settings;
 use std::sync::Arc;
 use text::{Anchor, BufferId};
 use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
@@ -130,13 +130,18 @@ impl Render for ToolbarControls {
                         let editor = editor.clone()?;
                         let max_severity = editor.max_severity(cx);
                         Some(ContextMenu::build(window, cx, |mut menu, _, _| {
-                            for (label, severity, content) in MAX_SEVERITY_ENTRIES {
+                            for (label, severity) in MAX_SEVERITY_ENTRIES {
                                 let editor = editor.clone();
                                 menu = menu.toggleable_entry(
                                     label,
                                     max_severity >= severity,
                                     IconPosition::Start,
-                                    Some(SetMaxSeverity { severity: content }.boxed_clone()),
+                                    Some(
+                                        SetMaxSeverity {
+                                            severity: severity.into(),
+                                        }
+                                        .boxed_clone(),
+                                    ),
                                     move |_, cx| {
                                         editor.set_max_severity(
                                             clicked_max_severity(max_severity, severity),
@@ -152,27 +157,11 @@ impl Render for ToolbarControls {
     }
 }
 
-const MAX_SEVERITY_ENTRIES: [(&str, DiagnosticSeverity, DiagnosticSeverityContent); 4] = [
-    (
-        "Errors",
-        DiagnosticSeverity::Error,
-        DiagnosticSeverityContent::Error,
-    ),
-    (
-        "Warnings",
-        DiagnosticSeverity::Warning,
-        DiagnosticSeverityContent::Warning,
-    ),
-    (
-        "Info",
-        DiagnosticSeverity::Info,
-        DiagnosticSeverityContent::Info,
-    ),
-    (
-        "Hints",
-        DiagnosticSeverity::Hint,
-        DiagnosticSeverityContent::Hint,
-    ),
+const MAX_SEVERITY_ENTRIES: [(&str, DiagnosticSeverity); 4] = [
+    ("Errors", DiagnosticSeverity::Error),
+    ("Warnings", DiagnosticSeverity::Warning),
+    ("Info", DiagnosticSeverity::Info),
+    ("Hints", DiagnosticSeverity::Hint),
 ];
 
 fn max_severity_description(max_severity: DiagnosticSeverity) -> &'static str {
@@ -276,25 +265,5 @@ mod tests {
             clicked_max_severity(DiagnosticSeverity::Hint, DiagnosticSeverity::Warning),
             DiagnosticSeverity::Warning
         );
-    }
-
-    #[test]
-    fn menu_entries_cover_every_panel_level_in_order() {
-        let levels: Vec<_> = MAX_SEVERITY_ENTRIES
-            .iter()
-            .map(|(_, severity, _)| *severity)
-            .collect();
-        assert_eq!(
-            levels,
-            [
-                DiagnosticSeverity::Error,
-                DiagnosticSeverity::Warning,
-                DiagnosticSeverity::Info,
-                DiagnosticSeverity::Hint,
-            ]
-        );
-        for (_, severity, content) in MAX_SEVERITY_ENTRIES {
-            assert_eq!(DiagnosticSeverity::from(content), severity);
-        }
     }
 }

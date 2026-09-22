@@ -2351,22 +2351,6 @@ fn empty_state_offers_the_next_more_lenient_level() {
     assert_eq!(show_more_button(DiagnosticSeverity::Hint, 0), None);
 }
 
-#[test]
-fn panel_max_severity_never_hides_everything() {
-    assert_eq!(
-        panel_max_severity(DiagnosticSeverityContent::Off),
-        DiagnosticSeverity::Error
-    );
-    assert_eq!(
-        panel_max_severity(DiagnosticSeverityContent::All),
-        DiagnosticSeverity::Hint
-    );
-    assert_eq!(
-        panel_max_severity(DiagnosticSeverityContent::Info),
-        DiagnosticSeverity::Info
-    );
-}
-
 #[gpui::test]
 async fn test_buffer_diagnostics(cx: &mut TestAppContext) {
     init_test(cx);

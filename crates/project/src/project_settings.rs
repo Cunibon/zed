@@ -394,6 +394,15 @@ impl DiagnosticSeverity {
             DiagnosticSeverity::Hint => Some(lsp::DiagnosticSeverity::HINT),
         }
     }
+
+    /// `Off` would leave a diagnostics view permanently empty, so the views
+    /// clamp it to the strictest useful threshold.
+    pub fn clamp_for_panel(self) -> Self {
+        match self {
+            DiagnosticSeverity::Off => DiagnosticSeverity::Error,
+            severity => severity,
+        }
+    }
 }
 
 impl From<settings::DiagnosticSeverityContent> for DiagnosticSeverity {
@@ -405,6 +414,18 @@ impl From<settings::DiagnosticSeverityContent> for DiagnosticSeverity {
             settings::DiagnosticSeverityContent::Info => DiagnosticSeverity::Info,
             settings::DiagnosticSeverityContent::Hint => DiagnosticSeverity::Hint,
             settings::DiagnosticSeverityContent::All => DiagnosticSeverity::Hint,
+        }
+    }
+}
+
+impl From<DiagnosticSeverity> for settings::DiagnosticSeverityContent {
+    fn from(severity: DiagnosticSeverity) -> Self {
+        match severity {
+            DiagnosticSeverity::Off => settings::DiagnosticSeverityContent::Off,
+            DiagnosticSeverity::Error => settings::DiagnosticSeverityContent::Error,
+            DiagnosticSeverity::Warning => settings::DiagnosticSeverityContent::Warning,
+            DiagnosticSeverity::Info => settings::DiagnosticSeverityContent::Info,
+            DiagnosticSeverity::Hint => settings::DiagnosticSeverityContent::Hint,
         }
     }
 }
@@ -667,7 +688,9 @@ fn resolve_panel_max_severity(
     max_severity: Option<settings::DiagnosticSeverityContent>,
     include_warnings: bool,
 ) -> DiagnosticSeverity {
-    match max_severity.map(DiagnosticSeverity::from) {
+    let max_severity =
+        max_severity.map(|max_severity| DiagnosticSeverity::from(max_severity).clamp_for_panel());
+    match max_severity {
         None => {
             if include_warnings {
                 DiagnosticSeverity::Warning
@@ -675,7 +698,6 @@ fn resolve_panel_max_severity(
                 DiagnosticSeverity::Error
             }
         }
-        Some(DiagnosticSeverity::Off) => DiagnosticSeverity::Error,
         Some(DiagnosticSeverity::Warning) if !include_warnings => DiagnosticSeverity::Error,
         Some(max_severity) => max_severity,
     }
