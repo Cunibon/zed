@@ -1905,51 +1905,15 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     let cx = &mut cx;
 
     let diagnostics = open_project_diagnostics(DiagnosticSeverity::Error, &project, &workspace, cx);
-    workspace.update_in(cx, |workspace, window, cx| {
-        workspace.add_item_to_active_pane(Box::new(diagnostics.clone()), None, true, window, cx)
-    });
     let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
     diagnostics
         .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
         .await;
 
-    let errors_only = indoc::indoc! {
-        "§ main.rs
-         § -----
-         fn main() {
-             error(); § an error
-             warning();
-             info();"
-    };
-    let errors_and_warnings = indoc::indoc! {
-        "§ main.rs
-         § -----
-         fn main() {
-             error(); § an error
-             warning(); § a warning
-             info();
-             hint();"
-    };
-    let errors_warnings_and_info = indoc::indoc! {
-        "§ main.rs
-         § -----
-         fn main() {
-             error(); § an error
-             warning(); § a warning
-             info(); § some info
-             hint();
-         }"
-    };
-    let everything = indoc::indoc! {
-        "§ main.rs
-         § -----
-         fn main() {
-             error(); § an error
-             warning(); § a warning
-             info(); § some info
-             hint(); § a hint
-         }"
-    };
+    let errors_only = four_severity_rendering(DiagnosticSeverity::Error);
+    let errors_and_warnings = four_severity_rendering(DiagnosticSeverity::Warning);
+    let errors_warnings_and_info = four_severity_rendering(DiagnosticSeverity::Info);
+    let everything = four_severity_rendering(DiagnosticSeverity::Hint);
 
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
     assert_eq!(
@@ -2007,14 +1971,39 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
         DiagnosticSeverity::Warning
     );
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_and_warnings);
+}
 
-    // The action is bindable to any level; `off` would hide everything, so it
-    // is clamped to errors.
+#[gpui::test]
+async fn test_set_max_severity_off_is_clamped_to_errors(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let (project, workspace, mut cx) = four_severity_project(cx).await;
+    let cx = &mut cx;
+
+    let diagnostics =
+        open_project_diagnostics(DiagnosticSeverity::Warning, &project, &workspace, cx);
+    // The action is dispatched to the window, so the view has to sit in a pane.
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(diagnostics.clone()), None, true, window, cx)
+    });
+    let editor = diagnostics.update(cx, |diagnostics, _| diagnostics.editor.clone());
+    diagnostics
+        .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
+        .await;
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        four_severity_rendering(DiagnosticSeverity::Warning)
+    );
+
+    // `off` would hide everything, so the action clamps it to errors.
     cx.dispatch_action(SetMaxSeverity {
         severity: DiagnosticSeverityContent::Off,
     });
     settle_diagnostics(cx);
-    pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
+    pretty_assertions::assert_eq!(
+        editor_content_with_blocks(&editor, cx),
+        four_severity_rendering(DiagnosticSeverity::Error)
+    );
 }
 
 #[gpui::test]
@@ -2030,16 +2019,7 @@ async fn test_project_diagnostics_threshold_survives_settings_changes(cx: &mut T
         .next_notification(DIAGNOSTICS_UPDATE_DEBOUNCE + Duration::from_millis(10), cx)
         .await;
 
-    let errors_warnings_and_info = indoc::indoc! {
-        "§ main.rs
-         § -----
-         fn main() {
-             error(); § an error
-             warning(); § a warning
-             info(); § some info
-             hint();
-         }"
-    };
+    let errors_warnings_and_info = four_severity_rendering(DiagnosticSeverity::Info);
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
         errors_warnings_and_info
@@ -2159,6 +2139,48 @@ async fn four_severity_project(
             .unwrap();
     });
     (project, workspace, cx)
+}
+
+fn four_severity_rendering(max_severity: DiagnosticSeverity) -> &'static str {
+    match max_severity {
+        DiagnosticSeverity::Off | DiagnosticSeverity::Error => indoc! {
+            "§ main.rs
+             § -----
+             fn main() {
+                 error(); § an error
+                 warning();
+                 info();"
+        },
+        DiagnosticSeverity::Warning => indoc! {
+            "§ main.rs
+             § -----
+             fn main() {
+                 error(); § an error
+                 warning(); § a warning
+                 info();
+                 hint();"
+        },
+        DiagnosticSeverity::Info => indoc! {
+            "§ main.rs
+             § -----
+             fn main() {
+                 error(); § an error
+                 warning(); § a warning
+                 info(); § some info
+                 hint();
+             }"
+        },
+        DiagnosticSeverity::Hint => indoc! {
+            "§ main.rs
+             § -----
+             fn main() {
+                 error(); § an error
+                 warning(); § a warning
+                 info(); § some info
+                 hint(); § a hint
+             }"
+        },
+    }
 }
 
 fn four_severity_diagnostics() -> Vec<lsp::Diagnostic> {
