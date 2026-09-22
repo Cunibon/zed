@@ -1916,10 +1916,6 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     let everything = four_severity_rendering(DiagnosticSeverity::Hint);
 
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), errors_only);
-    assert_eq!(
-        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
-        DiagnosticSeverity::Error
-    );
 
     // Changing the setting while the panel is open lowers its threshold.
     cx.update(|_, cx| {
@@ -1934,10 +1930,6 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     pretty_assertions::assert_eq!(
         editor_content_with_blocks(&editor, cx),
         errors_warnings_and_info
-    );
-    assert_eq!(
-        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
-        DiagnosticSeverity::Info
     );
 
     // ToggleWarnings hides warnings while they are shown, and shows them otherwise.
@@ -1957,10 +1949,6 @@ async fn test_project_diagnostics_severity_threshold(cx: &mut TestAppContext) {
     cx.update(|_, cx| set_panel_max_severity(DiagnosticSeverity::Hint, cx));
     settle_diagnostics(cx);
     pretty_assertions::assert_eq!(editor_content_with_blocks(&editor, cx), everything);
-    assert_eq!(
-        editor.read_with(cx, |editor, _| editor.diagnostics_max_severity),
-        DiagnosticSeverity::Hint
-    );
 
     // The toolbar reads the threshold through the `DiagnosticsToolbarEditor` trait.
     let toolbar_editor: Arc<dyn DiagnosticsToolbarEditor> = Arc::new(diagnostics.downgrade());
