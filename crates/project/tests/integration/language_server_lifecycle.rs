@@ -728,6 +728,59 @@ async fn test_suspension_disabled_by_default(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_changing_idle_suspension_setting_rearms_pending_timer(cx: &mut gpui::TestAppContext) {
+    const INITIAL_IDLE_MINUTES: u64 = 10;
+    const SHORTER_IDLE_MINUTES: u64 = 1;
+    const SHORTER_IDLE: Duration = Duration::from_secs(SHORTER_IDLE_MINUTES * 60);
+
+    init_test(cx);
+    set_suspension_settings(Some(INITIAL_IDLE_MINUTES), None, None, cx);
+    let mut fixture = suspension_fixture(path!("/dir").as_ref(), cx).await;
+
+    // Shortening the delay while a longer timer is pending re-arms it with the new delay
+    // instead of waiting the old one out.
+    fixture
+        .project
+        .update(cx, |project, cx| project.set_window_active(false, cx));
+    set_suspension_settings(Some(SHORTER_IDLE_MINUTES), None, None, cx);
+    advance(cx, SHORTER_IDLE);
+    expect_exit(
+        &mut fixture.fake_rust_server,
+        "the language server should exit after the shortened idle delay",
+        cx,
+    )
+    .await;
+    assert_suspended(&fixture.lsp_store, cx);
+
+    fixture
+        .project
+        .update(cx, |project, cx| project.set_window_active(true, cx));
+    let mut fake_rust_server_2 = expect_server_start(
+        &mut fixture.fake_rust_servers,
+        "a language server should start again when the window becomes active",
+        cx,
+    )
+    .await;
+    expect_did_open(&mut fake_rust_server_2, path!("/dir/a.rs").as_ref()).await;
+
+    // Disabling idle suspension while a timer is pending cancels it.
+    fixture
+        .project
+        .update(cx, |project, cx| project.set_window_active(false, cx));
+    set_suspension_settings(None, None, None, cx);
+    advance(cx, Duration::from_secs(60 * 60));
+    assert_still_running(
+        &mut fake_rust_server_2,
+        "disabling idle suspension must cancel the pending suspension",
+    );
+    assert_no_server_started(
+        &mut fixture.fake_rust_servers,
+        "no new language server should have been started",
+    );
+    assert_running(&fixture.lsp_store, &fake_rust_server_2, cx);
+}
+
+#[gpui::test]
 async fn test_user_stopped_servers_stay_stopped_across_suspend_resume(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -885,6 +938,92 @@ async fn test_over_budget_grace_suspends_after_it_elapses(cx: &mut gpui::TestApp
     .await;
     assert_suspended(&project_a.lsp_store, cx);
     assert_running(&project_b.lsp_store, &project_b.fake_rust_server, cx);
+}
+
+#[gpui::test]
+async fn test_over_budget_suspension_is_waived_when_newer_project_stops_counting(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    set_suspension_settings(None, Some(1), Some(GRACE_SECS), cx);
+    let (mut project_a, mut project_b) = two_project_budget_fixture(cx).await;
+
+    // Project B puts A over budget, then stops all its servers before A's grace period ends,
+    // so it no longer takes the slot A would have had to give up.
+    project_b
+        .project
+        .update(cx, |project, cx| project.set_window_active(true, cx));
+    project_b.lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.stop_all_language_servers(cx);
+    });
+    expect_exit(
+        &mut project_b.fake_rust_server,
+        "stopping all of project B's servers should shut its language server down",
+        cx,
+    )
+    .await;
+    advance(cx, GRACE);
+    assert_still_running(
+        &mut project_a.fake_rust_server,
+        "project A must keep its server once the project that put it over budget runs none",
+    );
+    assert_running(&project_a.lsp_store, &project_a.fake_rust_server, cx);
+
+    // Project B runs a server and puts A over budget again, then is closed before A's grace
+    // period ends.
+    project_b.lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.restart_all_language_servers(cx);
+    });
+    let mut fake_rust_server_b2 = expect_server_start(
+        &mut project_b.fake_rust_servers,
+        "restarting all servers should start project B's server again",
+        cx,
+    )
+    .await;
+    expect_did_open(&mut fake_rust_server_b2, path!("/dir_b/a.rs").as_ref()).await;
+    project_b
+        .project
+        .update(cx, |project, cx| project.set_window_active(true, cx));
+    drop(project_b);
+    // Dropping the handles only marks the project for release; the next update releases it.
+    cx.update(|_| {});
+    advance(cx, GRACE);
+    assert_still_running(
+        &mut project_a.fake_rust_server,
+        "project A must keep its server once the project that put it over budget is closed",
+    );
+    assert_running(&project_a.lsp_store, &project_a.fake_rust_server, cx);
+}
+
+#[gpui::test]
+async fn test_budget_suspends_least_recently_active_project_first(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    set_suspension_settings(None, Some(2), Some(GRACE_SECS), cx);
+    let (mut project_a, mut project_b) = two_project_budget_fixture(cx).await;
+    project_b
+        .project
+        .update(cx, |project, cx| project.set_window_active(true, cx));
+    let project_c = suspension_fixture(path!("/dir_c").as_ref(), cx).await;
+
+    // A third active project exceeds the budget of two. Only A, the least recently active
+    // project, gives up its servers; B, activated after A, keeps running.
+    project_c
+        .project
+        .update(cx, |project, cx| project.set_window_active(true, cx));
+    advance(cx, GRACE);
+    expect_exit(
+        &mut project_a.fake_rust_server,
+        "project A, the least recently active project, should give up its server",
+        cx,
+    )
+    .await;
+    assert_suspended(&project_a.lsp_store, cx);
+    assert_still_running(
+        &mut project_b.fake_rust_server,
+        "project B, activated after project A, must keep its server",
+    );
+    assert_running(&project_b.lsp_store, &project_b.fake_rust_server, cx);
+    assert_running(&project_c.lsp_store, &project_c.fake_rust_server, cx);
 }
 
 #[gpui::test]
