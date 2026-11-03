@@ -711,7 +711,6 @@ fn start_server(
                         lsp_store.restart_language_servers_for_buffers(
                             buffers,
                             HashSet::from_iter([LanguageServerSelector::Name(server_name.clone())]),
-                            true,
                             cx,
                         );
                     }
@@ -849,7 +848,7 @@ fn tooltip_for_server_binary(
     let runtime = path_style.file_name(&server_binary.path).and_then(|name| {
         ["node", "python"]
             .into_iter()
-            .find(|runtime| name.starts_with(runtime))
+            .find(|runtime| name.to_string_lossy().starts_with(runtime))
     });
 
     let target_path = runtime
@@ -862,7 +861,10 @@ fn tooltip_for_server_binary(
         .map(Path::new)
         .unwrap_or(&server_binary.path);
 
-    let display_path = path_style.normalize(&target_path.compact().to_string_lossy());
+    let display_path = path_style
+        .normalize_lexically(&target_path.compact())
+        .to_string_lossy()
+        .into_owned();
 
     match runtime {
         Some(runtime) => format!("{display_path} ({runtime})").into(),

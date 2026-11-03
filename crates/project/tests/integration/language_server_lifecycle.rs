@@ -191,18 +191,17 @@ async fn test_stop_all_language_servers_is_reversible(cx: &mut gpui::TestAppCont
     );
 
     // `editor::RestartLanguageServer` restarts the servers of the editor's buffers
-    // with `clear_stopped`, which must revive servers after "Stop All".
+    // explicitly, which must revive servers after "Stop All".
     project.update(cx, |project, cx| {
         project.restart_language_servers_for_buffers(
             vec![buffer_a.clone()],
             HashSet::default(),
-            true,
             cx,
         );
     });
     let mut fake_rust_server_2 = expect_server_start(
         &mut fake_rust_servers,
-        "a language server should start after restarting with clear_stopped",
+        "a language server should start after an explicit restart",
         cx,
     )
     .await;

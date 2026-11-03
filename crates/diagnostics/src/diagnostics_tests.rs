@@ -11,7 +11,7 @@ use editor::{
 };
 use gpui::{TestAppContext, VisualTestContext};
 use indoc::indoc;
-use language::{DiagnosticSourceKind, Rope};
+use language::{BufferId, Diagnostic, DiagnosticEntryRef, DiagnosticSourceKind, Rope};
 use lsp::LanguageServerId;
 use pretty_assertions::assert_eq;
 use project::{
@@ -141,7 +141,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
              § move occurs because `y` has type `Vec<char>`, which does not implement
              § the `Copy` trait (back)
                  a(x); § value moved here (back)
-                 b(y); § value moved here
+                 b(y); § value moved here (back)
                  // comment 1
                  // comment 2
                  c(y);
@@ -221,7 +221,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
              § move occurs because `y` has type `Vec<char>`, which does not implement
              § the `Copy` trait (back)
                  a(x); § value moved here (back)
-                 b(y); § value moved here
+                 b(y); § value moved here (back)
                  // comment 1
                  // comment 2
                  c(y);
@@ -312,7 +312,7 @@ async fn test_diagnostics(cx: &mut TestAppContext) {
              § move occurs because `y` has type `Vec<char>`, which does not implement
              § the `Copy` trait (back)
                  a(x); § value moved here (back)
-                 b(y); § value moved here
+                 b(y); § value moved here (back)
                  // comment 1
                  // comment 2
                  c(y);
@@ -429,7 +429,7 @@ async fn test_diagnostics_with_folds(cx: &mut TestAppContext) {
         indoc::indoc! {
             "§ main.js
              § -----
-             function test() { § method `test` defined here
+             function test() { § method `test` defined here (back)
                  return 1
              };
 
@@ -1319,6 +1319,62 @@ async fn test_diagnostics_with_links(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     cx.update_editor(|editor, _, _| assert!(editor.hover_state.diagnostic_popover.is_some()))
+}
+
+#[gpui::test]
+fn test_nearby_related_diagnostic_links_back_to_primary(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let buffer_id = BufferId::new(1).expect("test buffer ID should be nonzero");
+    let group_id = 1;
+    let diagnostic_group = [
+        DiagnosticEntryRef {
+            range: text::Point::new(10, 4)..text::Point::new(10, 16),
+            diagnostic: &Diagnostic {
+                message: "the trait bound `(): HasTest` is not satisfied".into(),
+                is_primary: true,
+                group_id,
+                ..Default::default()
+            },
+        },
+        DiagnosticEntryRef {
+            range: text::Point::new(13, 0)..text::Point::new(13, 22),
+            diagnostic: &Diagnostic {
+                message: "required by a bound in `Test::TestAssoc`".into(),
+                group_id,
+                ..Default::default()
+            },
+        },
+    ];
+
+    let primary_index = diagnostic_group
+        .iter()
+        .position(|entry| entry.diagnostic.is_primary)
+        .expect("test diagnostic group should contain a primary diagnostic");
+    let expected_back_link =
+        format!("([back](file://#diagnostic-{buffer_id}-{group_id}-{primary_index}))");
+
+    cx.update(|cx| {
+        let blocks = diagnostic_renderer::DiagnosticRenderer::diagnostic_blocks_for_group(
+            diagnostic_group.to_vec(),
+            buffer_id,
+            None,
+            None,
+            cx,
+        );
+
+        let [_primary_block, related_block] = blocks.as_slice() else {
+            panic!("expected one primary and one related diagnostic block");
+        };
+
+        let markdown = related_block.markdown.read(cx).source();
+
+        assert!(
+            markdown.contains(&expected_back_link),
+            "related diagnostic should link back to the primary diagnostic, got: {}",
+            markdown
+        );
+    });
 }
 
 #[gpui::test]
@@ -2392,9 +2448,9 @@ async fn test_buffer_diagnostics(cx: &mut TestAppContext) {
              § the `Copy` trait (back)
                  let y = vec![];
              § move occurs because `y` has type `Vec<char>`, which does not implement
-             § the `Copy` trait
-                 a(x); § value moved here
-                 b(y); § value moved here
+             § the `Copy` trait (back)
+                 a(x); § value moved here (back)
+                 b(y); § value moved here (back)
                  c(y);
              § use of moved value
              § value used here after move
@@ -2538,7 +2594,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
              § move occurs because `x` has type `Vec<char>`, which does not implement
              § the `Copy` trait (back)
                  let y = vec![];
-                 a(x); § value moved here
+                 a(x); § value moved here (back)
                  b(y);
                  c(y);
                  d(x);
@@ -2565,9 +2621,9 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
              § the `Copy` trait (back)
                  let y = vec![];
              § move occurs because `y` has type `Vec<char>`, which does not implement
-             § the `Copy` trait
-                 a(x); § value moved here
-                 b(y); § value moved here
+             § the `Copy` trait (back)
+                 a(x); § value moved here (back)
+                 b(y); § value moved here (back)
                  c(y);
              § use of moved value
              § value used here after move
@@ -2594,9 +2650,9 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
              § the `Copy` trait (back)
                  let y = vec![];
              § move occurs because `y` has type `Vec<char>`, which does not implement
-             § the `Copy` trait
-                 a(x); § value moved here
-                 b(y); § value moved here
+             § the `Copy` trait (back)
+                 a(x); § value moved here (back)
+                 b(y); § value moved here (back)
                  c(y);
              § use of moved value
              § value used here after move
@@ -2623,9 +2679,9 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
              § the `Copy` trait (back)
                  let y = vec![];
              § move occurs because `y` has type `Vec<char>`, which does not implement
-             § the `Copy` trait
-                 a(x); § value moved here
-                 b(y); § value moved here
+             § the `Copy` trait (back)
+                 a(x); § value moved here (back)
+                 b(y); § value moved here (back)
                  c(y);
              § use of moved value
              § value used here after move
@@ -2659,7 +2715,7 @@ async fn test_buffer_diagnostics_severity_threshold(cx: &mut TestAppContext) {
              § move occurs because `x` has type `Vec<char>`, which does not implement
              § the `Copy` trait (back)
                  let y = vec![];
-                 a(x); § value moved here
+                 a(x); § value moved here (back)
                  b(y);
                  c(y);
                  d(x);

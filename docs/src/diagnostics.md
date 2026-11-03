@@ -74,7 +74,7 @@ The status bar only counts errors and warnings, so files that contain nothing bu
 
 ## Project Panel
 
-Project panel can have its entries coloured based on the severity of the diagnostics in the file.
+[Project panel](./project-panel.md) can have its entries coloured based on the severity of the diagnostics in the file.
 
 To configure, use
 
