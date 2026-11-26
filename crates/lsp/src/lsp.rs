@@ -525,8 +525,12 @@ impl LanguageServer {
     ) -> Result<Self> {
         let working_dir = if root_path.is_dir() {
             root_path
-        } else {
+        } else if root_path.exists() {
             root_path.parent().unwrap_or_else(|| Path::new("/"))
+        } else {
+            // Falling back to the parent of a deleted root would make the server
+            // index every sibling directory, e.g. all git worktrees next to a removed one.
+            anyhow::bail!("language server root {root_path:?} does not exist");
         };
         let root_uri = Uri::from_file_path(&working_dir)
             .map_err(|()| anyhow!("{working_dir:?} is not a valid URI"))?;
@@ -546,6 +550,8 @@ impl LanguageServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(target_os = "macos")]
+        command.new_process_group(true);
 
         let mut server = command
             .spawn()

@@ -72,6 +72,7 @@ pub struct Command {
     stdout_cfg: Option<Stdio>,
     stderr_cfg: Option<Stdio>,
     kill_on_drop: bool,
+    new_process_group: bool,
 }
 
 impl Command {
@@ -86,6 +87,7 @@ impl Command {
             stdout_cfg: None,
             stderr_cfg: None,
             kill_on_drop: false,
+            new_process_group: false,
         }
     }
 
@@ -168,6 +170,14 @@ impl Command {
         self
     }
 
+    /// Makes the child the leader of a new process group, so that [`Child::kill`]
+    /// also kills the processes the child spawned. Without it, killing a wrapper
+    /// such as `fvm dart language-server` leaves the wrapped process running.
+    pub fn new_process_group(&mut self, new_process_group: bool) -> &mut Self {
+        self.new_process_group = new_process_group;
+        self
+    }
+
     pub fn spawn(&mut self) -> io::Result<Child> {
         let current_dir = self
             .current_dir
@@ -205,6 +215,7 @@ impl Command {
             self.stdout_cfg.unwrap_or_default(),
             self.stderr_cfg.unwrap_or_default(),
             self.kill_on_drop,
+            self.new_process_group,
         )
     }
 
@@ -233,6 +244,7 @@ pub struct Child {
     pub stdin: Option<Async<std::fs::File>>,
     pub stdout: Option<Async<std::fs::File>>,
     pub stderr: Option<Async<std::fs::File>>,
+    leads_process_group: bool,
 }
 
 impl Child {
@@ -241,6 +253,17 @@ impl Child {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
+        if self.leads_process_group {
+            let result = unsafe { libc::killpg(self.inner.id() as libc::pid_t, libc::SIGKILL) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            // An empty group means every member is gone; let the child report that.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
         self.inner.kill()
     }
 
@@ -299,6 +322,7 @@ fn spawn_posix_spawn(
     stdout_cfg: Stdio,
     stderr_cfg: Stdio,
     kill_on_drop: bool,
+    new_process_group: bool,
 ) -> io::Result<Child> {
     // posix_spawnp resolves programs against the parent's cwd/PATH, not the child's.
     let resolved_program = if program.as_bytes().contains(&b'/') {
@@ -410,9 +434,14 @@ fn spawn_posix_spawn(
         }
         cvt_nz(libc::posix_spawnattr_setsigdefault(&mut attr, &default_set))?;
 
+        let mut flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT | libc::POSIX_SPAWN_SETSIGDEF;
+        if new_process_group {
+            flags |= libc::POSIX_SPAWN_SETPGROUP;
+            cvt_nz(libc::posix_spawnattr_setpgroup(&mut attr, 0))?;
+        }
         cvt_nz(libc::posix_spawnattr_setflags(
             &mut attr,
-            (libc::POSIX_SPAWN_CLOEXEC_DEFAULT | libc::POSIX_SPAWN_SETSIGDEF) as libc::c_short,
+            flags as libc::c_short,
         ))?;
 
         cvt_nz(posix_spawnattr_setexceptionports_np(
@@ -501,6 +530,7 @@ fn spawn_posix_spawn(
             stdin: stdin_write.map(Async::new).transpose()?,
             stdout: stdout_read.map(Async::new).transpose()?,
             stderr: stderr_read.map(Async::new).transpose()?,
+            leads_process_group: new_process_group,
         })
     }
 }
@@ -654,6 +684,37 @@ mod tests {
             let pid = child.id();
             drop(child);
             wait_until_gone(pid);
+        });
+    }
+
+    #[test]
+    fn test_kill_reaches_grandchildren_of_a_process_group_leader() {
+        smol::block_on(async {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "/bin/sleep 60 & echo $!; wait"])
+                .stdout(Stdio::piped())
+                .new_process_group(true)
+                .spawn()
+                .expect("failed to spawn command");
+            let mut stdout = child.stdout.take().expect("stdout is piped");
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                use futures_lite::AsyncReadExt;
+                let read = stdout.read(&mut byte).await.expect("failed to read pid");
+                if read == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            let grandchild_pid: u32 = String::from_utf8_lossy(&line)
+                .trim()
+                .parse()
+                .expect("the shell prints the pid of its background job");
+
+            child.kill().expect("failed to kill the process group");
+            child.status().await.expect("failed to reap the child");
+            wait_until_gone(grandchild_pid);
         });
     }
 
