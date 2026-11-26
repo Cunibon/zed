@@ -1,15 +1,14 @@
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
-    AuthRequired, ClientUserMessageId, ElicitationEntryId, ElicitationStatus, ElicitationStore,
-    ForegroundActivity, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
-    PermissionOptions, PermissionPattern, PermissionRequest, PermissionRequestId,
-    ProtocolErrorInfo, RetryStatus, SelectedPermissionOutcome, ThreadStatus, ToolCall,
-    ToolCallContent, ToolCallStatus,
+    AuthRequired, ElicitationEntryId, ElicitationStatus, ElicitationStore, ForegroundActivity,
+    LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice, PermissionOptions,
+    PermissionPattern, PermissionRequest, PermissionRequestId, ProtocolErrorInfo, RetryStatus,
+    SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
 };
-use acp_thread::{AgentConnection, Plan};
+use acp_thread::{AgentConnection, Plan, PlanContent};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
 use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
-use agent_client_protocol::schema::v2 as acp_v2;
+use agent_client_protocol::v2::schema as acp_v2;
 #[cfg(test)]
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
@@ -354,6 +353,7 @@ impl Conversation {
                     | AcpThreadEvent::EntriesRemoved(_)
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
+                    | AcpThreadEvent::SubagentAssociationUpdated
                     | AcpThreadEvent::Stopped { .. }
                     | AcpThreadEvent::Error
                     | AcpThreadEvent::ConnectionLost
@@ -400,26 +400,26 @@ impl Conversation {
         pattern_index: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(request) = self.permission_request(session_id, request_id, cx) else {
+        let Some(PermissionOptions::DropdownWithPatterns { patterns, .. }) = self
+            .permission_request(session_id, request_id, cx)
+            .and_then(PermissionRequest::legacy_options)
+        else {
             return;
         };
-        let Some(options) = request.legacy_options() else {
+        if pattern_index >= patterns.len() {
             return;
-        };
-        let pattern_count = match options {
-            PermissionOptions::DropdownWithPatterns { patterns, .. } => patterns.len(),
-            _ => 0,
-        };
+        }
         match self.permission_selections.get_mut(&request_id) {
             Some(selection @ thread_view::PermissionSelection::SelectedPatterns(_)) => {
                 selection.toggle_pattern(pattern_index);
+                if !selection.has_any_checked_patterns() {
+                    self.permission_selections.remove(&request_id);
+                }
             }
             _ => {
                 self.permission_selections.insert(
                     request_id,
-                    thread_view::PermissionSelection::SelectedPatterns(
-                        (0..pattern_count).collect(),
-                    ),
+                    thread_view::PermissionSelection::SelectedPatterns(vec![pattern_index]),
                 );
             }
         }
@@ -499,6 +499,10 @@ impl Conversation {
             request.legacy_tool_call_id()?.clone(),
             request.legacy_options()?,
         ))
+    }
+
+    pub(crate) fn thread(&self, session_id: &acp_v2::SessionId) -> Option<&Entity<AcpThread>> {
+        self.threads.get(session_id)
     }
 
     pub fn subagents_awaiting_permission(&self, cx: &App) -> Vec<(acp_v2::SessionId, usize)> {
@@ -789,6 +793,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::SubagentAssociationUpdated
         | AcpThreadEvent::NoticesUpdated
         | AcpThreadEvent::PromptUpdated => false,
     }
@@ -869,17 +874,17 @@ impl ConversationView {
             .pending_tool_call(&session_id, cx)
     }
 
-    pub fn root_thread_has_pending_tool_call(&self, cx: &App) -> bool {
+    pub fn root_thread_is_waiting_for_input(&self, cx: &App) -> bool {
         let Some(root_thread) = self.root_thread_view() else {
             return false;
         };
         let root_session_id = root_thread.read(cx).thread.read(cx).session_id().clone();
         self.as_connected().is_some_and(|connected| {
-            connected
-                .conversation
-                .read(cx)
+            let conversation = connected.conversation.read(cx);
+            conversation
                 .pending_tool_call(&root_session_id, cx)
                 .is_some()
+                || !conversation.elicitation_requests.is_empty()
         })
     }
 
@@ -1589,10 +1594,22 @@ impl ConversationView {
         let count = thread.read(cx).entries().len();
         let list_state = ListState::new(0, gpui::ListAlignment::Top, px(2048.0));
         list_state.set_follow_mode(gpui::FollowMode::Tail);
+        list_state.set_item_measurement_readiness({
+            let thread = thread.downgrade();
+            move |index, cx| {
+                thread.upgrade().is_none_or(|thread| {
+                    thread
+                        .read(cx)
+                        .entries()
+                        .get(index)
+                        .is_none_or(|entry| !entry.has_pending_markdown_render(cx))
+                })
+            }
+        });
 
         entry_view_state.update(cx, |view_state, cx| {
             for ix in 0..count {
-                view_state.sync_entry(ix, &thread, window, cx);
+                view_state.sync_entry_initial(ix, &thread, window, cx);
             }
             list_state.splice_focusable(
                 0..0,
@@ -1600,13 +1617,21 @@ impl ConversationView {
             );
         });
 
-        if let Some(scroll_position) = thread.read(cx).ui_scroll_position() {
+        let restored_scroll_position = thread
+            .read(cx)
+            .ui_scroll_position()
+            .filter(|offset| offset.item_ix < count);
+        if let Some(scroll_position) = restored_scroll_position {
             list_state.scroll_to(scroll_position);
         } else {
             list_state.scroll_to_end();
         }
 
-        AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+        // A subagent's edits are also recorded in its parent's action log, so reviewing the
+        // root thread covers the whole conversation.
+        if thread.read(cx).parent_session_id().is_none() {
+            AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+        }
 
         let connection = thread.read(cx).connection().clone();
         let session_id = thread.read(cx).session_id().clone();
@@ -1955,6 +1980,7 @@ impl ConversationView {
                         if is_latest {
                             active.current_submission = Some(*submission_id);
                         }
+                        active.sync_submission_reveal(*submission_id, cx);
                         cx.notify();
                     });
                 }
@@ -2018,6 +2044,9 @@ impl ConversationView {
                     self.add_subagent_thread_view(subagent, window, cx);
                 }
             }
+            // The parent's card and permission rows read the association; the notify below
+            // redraws them.
+            AcpThreadEvent::SubagentAssociationUpdated => {}
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
@@ -2273,8 +2302,6 @@ impl ConversationView {
                             native_available_skills(&native_connection, &session_id, cx)
                         })
                         .unwrap_or_default();
-                    let has_slash_completions =
-                        !available_commands.is_empty() || !available_skills.is_empty();
 
                     let agent_display_name = self
                         .agent_server_store
@@ -2282,13 +2309,15 @@ impl ConversationView {
                         .agent_display_name(&self.agent.agent_id())
                         .unwrap_or_else(|| self.agent.agent_id().0.to_string().into());
 
-                    let new_placeholder =
-                        placeholder_text(agent_display_name.as_ref(), has_slash_completions);
-
                     thread_view.update(cx, |thread_view, cx| {
-                        let mut session_capabilities = thread_view.session_capabilities.write();
-                        session_capabilities.set_available_commands(available_commands.clone());
-                        session_capabilities.set_available_skills(available_skills);
+                        let has_slash_completions = {
+                            let mut session_capabilities = thread_view.session_capabilities.write();
+                            session_capabilities.set_available_commands(available_commands.clone());
+                            session_capabilities.set_available_skills(available_skills);
+                            session_capabilities.has_slash_completions()
+                        };
+                        let new_placeholder =
+                            placeholder_text(agent_display_name.as_ref(), has_slash_completions);
                         thread_view.message_editor.update(cx, |editor, cx| {
                             editor.set_placeholder_text(&new_placeholder, window, cx);
                         });
@@ -2566,6 +2595,8 @@ impl ConversationView {
     /// Restores a child session that a tool call references but its parent does not
     /// own, such as a native subagent from a thread loaded from the database. Children
     /// the parent already owns are never loaded: ACP forbids loading subagent sessions.
+    /// Neither is any session where the subagents RFD applies, since a child referenced
+    /// there may still be announced, and loading it first would reject the announcement.
     fn load_subagent_session(
         &mut self,
         subagent_id: acp_v2::SessionId,
@@ -2577,6 +2608,7 @@ impl ConversationView {
         };
         if connected.threads.contains_key(&subagent_id)
             || !connected.connection.supports_load_session()
+            || connected.connection.announces_subagents()
         {
             return;
         }
@@ -4273,10 +4305,10 @@ fn plan_label_markdown_style(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use acp_thread::StubAgentConnection;
+    use acp_thread::{ClientUserMessageId, StubAgentConnection};
     use action_log::ActionLog;
     use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
-    use agent_client_protocol::schema::v1 as acp_v1;
+    use agent_client_protocol::v1::schema as acp_v1;
     use agent_servers::FakeAcpAgentServer;
     use editor::MultiBufferOffset;
     use editor::actions::Paste;
@@ -4628,8 +4660,8 @@ pub(crate) mod tests {
             response: response.clone(),
         };
         let (conversation_view, cx) = setup_conversation_view(server, cx).await;
-        let first_request_id = acp_v1::RequestId::Number(1);
-        let second_request_id = acp_v1::RequestId::Number(2);
+        let first_request_id = acp_v2::RequestId::Number(1);
+        let second_request_id = acp_v2::RequestId::Number(2);
         let first_elicitation_id = store.read_with(cx, |store, _cx| {
             assert_eq!(
                 store.elicitations().len(),
@@ -5051,6 +5083,107 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_auto_sending_queued_messages_preserves_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (background_conversation, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(background_conversation.clone(), cx);
+        let background_thread = active_thread(&background_conversation, cx);
+        message_editor(&background_conversation, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        background_thread.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let session_id = background_thread.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["second".into()], vec![], window, cx);
+            view.add_to_queue(vec!["third".into()], vec![], window, cx);
+            view.thread.read(cx).session_id().clone()
+        });
+
+        let foreground_conversation = background_conversation.update_in(cx, |view, window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    view.agent.clone(),
+                    view.connection_store.clone(),
+                    view.connection_key.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    view.workspace.clone(),
+                    view.project.clone(),
+                    view.thread_store.clone(),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        add_to_workspace(foreground_conversation.clone(), cx);
+        let foreground_editor = message_editor(&foreground_conversation, cx);
+        foreground_editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.simulate_input("before");
+
+        for (remaining, expected_text) in [(1, "before typing"), (0, "before typing typing")] {
+            connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+            cx.run_until_parked();
+
+            background_thread.read_with(cx, |view, cx| {
+                assert_eq!(view.message_queue.len(), remaining);
+                assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            });
+            foreground_editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.focus_handle(cx).is_focused(window));
+            });
+            cx.simulate_input(" typing");
+            assert_eq!(
+                foreground_editor.read_with(cx, |editor, cx| editor.text(cx)),
+                expected_text
+            );
+            assert!(
+                message_editor(&background_conversation, cx)
+                    .read_with(cx, |editor, cx| { editor.is_empty(cx) })
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_manual_queued_message_sends_focus_composer(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        for send_now in [false, true] {
+            let (conversation, cx) =
+                setup_conversation_view(StubAgentServer::default_response(), cx).await;
+            add_to_workspace(conversation.clone(), cx);
+            let thread_view = active_thread(&conversation, cx);
+            thread_view.update_in(cx, |view, window, cx| {
+                view.add_to_queue(vec!["queued".into()], vec![], window, cx);
+                let entry = view.message_queue.first().expect("queued message");
+                let id = entry.id;
+                entry.editor.focus_handle(cx).focus(window, cx);
+                if send_now {
+                    view.send_queued_message_now(id, window, cx);
+                } else {
+                    view.send(window, cx);
+                }
+                assert!(view.message_queue.is_empty());
+                assert!(view.message_editor.focus_handle(cx).is_focused(window));
+            });
+            cx.run_until_parked();
+            message_editor(&conversation, cx).update_in(cx, |editor, window, cx| {
+                assert!(editor.focus_handle(cx).is_focused(window));
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_queued_message_steer_defaults_off_and_toggles(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -5140,6 +5273,13 @@ pub(crate) mod tests {
         });
         let copy_selector: &'static str =
             Box::leak(format!("copy-submission-{}", submission_id.as_u64()).into_boxed_str());
+        assert!(
+            cx.debug_bounds(copy_selector).is_none(),
+            "a fresh submission should not flash its status row"
+        );
+        cx.executor()
+            .advance_clock(thread_view::UNSETTLED_SUBMISSION_REVEAL_DELAY);
+        cx.run_until_parked();
         assert!(cx.debug_bounds(copy_selector).is_some());
         thread.update(cx, |thread, cx| {
             thread
@@ -5870,6 +6010,9 @@ pub(crate) mod tests {
         accept
             .send(Ok(acp_v2::PromptResponse::new("second-echo")))
             .expect("receipt receiver");
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(thread_view::UNSETTLED_SUBMISSION_REVEAL_DELAY);
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {
             assert_eq!(
@@ -6773,6 +6916,51 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_subagent_views_keep_the_root_thread_under_review(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let workspace = conversation_view.read_with(cx, |view, _| view.workspace.clone());
+        let reviewed_thread = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| AgentDiff::reviewed_thread(&workspace, cx))
+        };
+        assert_eq!(reviewed_thread(cx).as_ref(), Some(&root));
+
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                Some(root_session_id),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+        assert!(
+            conversation_view.read_with(cx, |view, _| view
+                .thread_view(&acp_v2::SessionId::new("child"))
+                .is_some()),
+            "the subagent got its view"
+        );
+        assert_eq!(reviewed_thread(cx).as_ref(), Some(&root));
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(acp_v2::SessionId::new("child"), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            reviewed_thread(cx).as_ref(),
+            Some(&root),
+            "opening a subagent keeps the conversation's edits under review"
+        );
+    }
+
+    #[gpui::test]
     async fn test_subagent_card_state_follows_the_spawn_tool_call(cx: &mut TestAppContext) {
         use super::subagent_card::{SubagentCardState, SubagentEntries, SubagentStatus};
 
@@ -6871,6 +7059,137 @@ pub(crate) mod tests {
                     end: Some(5),
                 }),
                 "{id}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_finished_subagent_tool_call_shows_its_runs_reported_outcome(
+        cx: &mut TestAppContext,
+    ) {
+        use super::subagent_card::{SubagentCardState, SubagentStatus};
+
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let parent = cx.update(|cx| {
+            create_test_acp_thread(None, "parent", connection.clone(), project.clone(), cx)
+        });
+        let parent_session_id = parent.read_with(cx, |thread, _| thread.session_id().clone());
+        let reporting = cx.update(|cx| {
+            create_test_acp_subagent(
+                parent_session_id.clone(),
+                "reporting",
+                connection.clone(),
+                project.clone(),
+                cx,
+            )
+        });
+        let silent = cx.update(|cx| {
+            create_test_acp_subagent(
+                parent_session_id.clone(),
+                "silent",
+                connection.clone(),
+                project.clone(),
+                cx,
+            )
+        });
+        let without_association = cx.update(|cx| {
+            create_test_acp_thread(
+                Some(parent_session_id),
+                "unassociated",
+                connection,
+                project,
+                cx,
+            )
+        });
+        for subagent in [&reporting, &silent, &without_association] {
+            subagent
+                .update(cx, |subagent, cx| {
+                    subagent.upsert_assistant_message(
+                        acp_v2::AgentMessage::new("work").content(vec!["Working".into()]),
+                        cx,
+                    )
+                })
+                .expect("subagent work");
+        }
+        reporting
+            .update(cx, |subagent, cx| {
+                subagent.update_session_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::Cancelled),
+                    ),
+                    cx,
+                )
+            })
+            .expect("reported outcome");
+
+        let spawn = |id: &str, status, end, cx: &mut TestAppContext| {
+            let session_info = acp_v2::Meta::from_iter([(
+                acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                serde_json::to_value(acp_thread::SubagentSessionInfo {
+                    session_id: acp_v2::SessionId::new("child"),
+                    message_start_index: 0,
+                    message_end_index: end,
+                })
+                .expect("subagent session info should serialize"),
+            )]);
+            parent
+                .update(cx, |thread, cx| {
+                    thread.upsert_wire_tool_call(
+                        acp_v2::ToolCallUpdate::new(id)
+                            .title("Explore")
+                            .status(status)
+                            .content(vec!["Found it".into()])
+                            .meta(session_info),
+                        cx,
+                    )
+                })
+                .expect("spawn tool call should apply");
+        };
+        spawn("finished", acp_v2::ToolCallStatus::Completed, Some(0), cx);
+        spawn("running", acp_v2::ToolCallStatus::InProgress, None, cx);
+
+        for (id, subagent, expected) in [
+            ("finished", &reporting, SubagentStatus::Canceled),
+            ("finished", &silent, SubagentStatus::Completed),
+            ("finished", &without_association, SubagentStatus::Completed),
+            ("running", &reporting, SubagentStatus::Running),
+        ] {
+            let state = cx.update(|cx| {
+                let parent = parent.read(cx);
+                let (_, tool_call) = parent
+                    .tool_call(&acp_v2::ToolCallId::new(id))
+                    .expect("spawn tool call should exist");
+                SubagentCardState::for_subagent_tool_call(tool_call, Some(subagent.read(cx)), cx)
+            });
+            let subagent_id = subagent.read_with(cx, |subagent, _| subagent.session_id().clone());
+            assert_eq!(state.status, expected, "{id} with {subagent_id}");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_referenced_subagents_load_only_without_the_subagents_rfd(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        for announces_subagents in [false, true] {
+            let connection = StubAgentConnection::new()
+                .with_supports_load_session(true)
+                .with_announced_subagents(announces_subagents);
+            let (conversation_view, cx) =
+                setup_conversation_view(StubAgentServer::new(connection), cx).await;
+            let root_session_id = active_thread(&conversation_view, cx)
+                .read_with(cx, |view, _| view.session_id.clone());
+            let referenced = acp_v2::SessionId::new("referenced");
+            conversation_view.update(cx, |view, cx| {
+                view.load_subagent_session(referenced.clone(), root_session_id, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                conversation_view.read_with(cx, |view, _| view.thread_view(&referenced).is_some()),
+                !announces_subagents,
+                "a session a tool call references is loaded only where the RFD does not apply"
             );
         }
     }
@@ -7374,8 +7693,8 @@ pub(crate) mod tests {
                 .available_commands()
                 .to_vec();
             assert_eq!(available_commands.len(), 1);
-            assert_eq!(available_commands[0].name.as_str(), "help");
-            assert_eq!(available_commands[0].description.as_str(), "Get help");
+            assert_eq!(available_commands[0].name(), "help");
+            assert_eq!(available_commands[0].description(), "Get help");
         });
 
         assert_eq!(
@@ -7396,6 +7715,7 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
         let command_payload = json!({
+            "type": "command",
             "name": "deploy",
             "description": "Updated command",
             "input": {
@@ -9330,6 +9650,94 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_selection_query_after_streaming_hides_clicked_syntax(cx: &mut TestAppContext) {
+        use gpui::Focusable as _;
+
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let workspace = conversation_view.read_with(cx, |view, _| view.workspace.clone());
+        let editor_pane = workspace
+            .update_in(cx, |workspace, window, cx| {
+                let thread_pane = workspace.active_pane().clone();
+                workspace.split_pane(thread_pane, workspace::SplitDirection::Right, window, cx)
+            })
+            .unwrap();
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let stream_text = |text: &str, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                connection.send_update(
+                    session_id.clone(),
+                    acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        text.into(),
+                    )),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+        };
+
+        stream_text("См. [док](https://exa", cx);
+        let markdown = thread.read_with(cx, |thread, _| {
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries()[1] else {
+                panic!("expected an assistant message");
+            };
+            let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+                panic!("expected a message chunk");
+            };
+            block
+                .blocks()
+                .next()
+                .and_then(|block| block.markdown().cloned())
+                .expect("message markdown")
+        });
+
+        // Clicking to the right of the text places the selection at the end of what has streamed.
+        let bounds = cx
+            .debug_bounds("message-content-1-0-0")
+            .expect("streamed message");
+        cx.simulate_click(
+            point(bounds.right() - px(2.), bounds.center().y),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| markdown.read(cx).focus_handle(cx).is_focused(window)));
+
+        stream_text("mple.com) далее и ещё", cx);
+        assert_eq!(
+            markdown.read_with(cx, |markdown, _| markdown.source().to_string()),
+            "См. [док](https://example.com) далее и ещё"
+        );
+
+        // Activating an item in another pane makes `Workspace` refresh the IME position.
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                let item = cx.new(workspace::item::test::TestItem::new);
+                workspace.add_item(editor_pane, Box::new(item), None, false, false, window, cx);
+            })
+            .unwrap();
+        cx.update(|window, cx| {
+            assert!(window.simulate_next_frame(cx) > 0);
+        });
+    }
+
+    #[gpui::test]
     async fn test_plan_completion_does_not_add_transcript_entries(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -9369,7 +9777,7 @@ pub(crate) mod tests {
                 .read(cx)
                 .plan()
                 .expect("active plan")
-                .entries
+                .entries()
                 .first()
                 .expect("active plan entry")
                 .content
@@ -9405,7 +9813,7 @@ pub(crate) mod tests {
                 thread
                     .plan()
                     .expect("completed plan")
-                    .entries
+                    .entries()
                     .first()
                     .expect("completed plan entry")
                     .content,
@@ -9431,7 +9839,7 @@ pub(crate) mod tests {
             let entry = thread
                 .plan()
                 .expect("reopened plan")
-                .entries
+                .entries()
                 .first()
                 .expect("reopened plan entry");
             assert_eq!(entry.content, plan_content);
@@ -9480,7 +9888,12 @@ pub(crate) mod tests {
         cx.run_until_parked();
         active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
             assert_thread_list_item_count_matches_entries(view, cx);
-            assert!(view.thread.read(cx).plan().is_none_or(Plan::is_empty));
+            assert!(
+                view.thread
+                    .read(cx)
+                    .plan()
+                    .is_none_or(|plan| plan.is_empty(cx))
+            );
         });
         connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
         cx.run_until_parked();
@@ -9488,7 +9901,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_plan_panel_dismissal_and_status_updates(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -9511,7 +9924,7 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         let markdown = thread.read_with(cx, |thread, _| {
-            thread.plan().expect("visible plan").entries[0]
+            thread.plan().expect("visible plan").entries()[0]
                 .content
                 .clone()
         });
@@ -9586,7 +9999,7 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds(row).is_some(), "{row}");
             thread.read_with(cx, |thread, cx| {
                 assert_eq!(
-                    thread.plan().expect("visible plan").entries[0].content,
+                    thread.plan().expect("visible plan").entries()[0].content,
                     markdown
                 );
                 assert_eq!(markdown.read(cx).source(), "Unchanged task");
@@ -9616,7 +10029,14 @@ pub(crate) mod tests {
         assert!(cx.debug_bounds("plan-status-All Done").is_none());
         thread.update(cx, |thread, cx| {
             thread.upsert_plan_items(acp_v2::PlanItems::new("status-plan", vec![]), None, cx);
-            assert!(thread.plan().expect("empty selected plan").is_empty());
+            assert!(thread.plan().is_none());
+            assert!(
+                thread
+                    .plan_by_id(&"status-plan".into())
+                    .expect("emptied plan")
+                    .entries()
+                    .is_empty()
+            );
             assert!(thread.entries().is_empty());
         });
         cx.run_until_parked();
@@ -10051,7 +10471,7 @@ pub(crate) mod tests {
                     .request_elicitation(
                         acp_v2::CreateElicitationRequest::new(
                             acp_v2::ElicitationFormMode::new(
-                                acp_v2::ElicitationRequestScope::new(acp_v1::RequestId::Number(1)),
+                                acp_v2::ElicitationRequestScope::new(acp_v2::RequestId::Number(1)),
                                 acp_v2::ElicitationSchema::new().string("name", true),
                             ),
                             "Provide a name",
@@ -10067,7 +10487,7 @@ pub(crate) mod tests {
                             acp_v2::CreateElicitationRequest::new(
                                 acp_v2::ElicitationFormMode::new(
                                     acp_v2::ElicitationRequestScope::new(
-                                        acp_v1::RequestId::Number(2),
+                                        acp_v2::RequestId::Number(2),
                                     ),
                                     acp_v2::ElicitationSchema::new().string("account", true),
                                 ),
@@ -10183,7 +10603,7 @@ pub(crate) mod tests {
                     .request_elicitation(
                         acp_v2::CreateElicitationRequest::new(
                             acp_v2::ElicitationFormMode::new(
-                                acp_v2::ElicitationRequestScope::new(acp_v1::RequestId::Number(1)),
+                                acp_v2::ElicitationRequestScope::new(acp_v2::RequestId::Number(1)),
                                 acp_v2::ElicitationSchema::new().string("name", true),
                             ),
                             "Provide a name",
@@ -10337,22 +10757,25 @@ pub(crate) mod tests {
                 authenticated: Arc::new(Mutex::new(false)),
                 error_source: AuthErrorSource::Marker,
                 auth_methods: vec![
-                    acp_v2::AuthMethod::Other(
-                        acp_v2::OtherAuthMethod::new(
-                            "_future_login",
-                            Self::OTHER_AUTH_METHOD_ID,
-                            "Future Login",
-                            std::collections::BTreeMap::from([
-                                ("args".into(), json!(["must-not-run"])),
-                                ("details".into(), json!({"nested": [1, {"preserve": true}]})),
-                            ]),
-                        )
-                        .description("Not supported by this client")
-                        .meta(serde_json::Map::from_iter([(
-                            "terminal-auth".into(),
-                            json!({"command": "must-not-run", "args": ["login"]}),
-                        )])),
-                    ),
+                    acp_v2::AuthMethod::Other(acp_v2::OtherAuthMethod::new(
+                        "_future_login",
+                        Self::OTHER_AUTH_METHOD_ID,
+                        "Future Login",
+                        std::collections::BTreeMap::from([
+                            ("args".into(), json!(["must-not-run"])),
+                            ("details".into(), json!({"nested": [1, {"preserve": true}]})),
+                            ("description".into(), json!("Not supported by this client")),
+                            (
+                                "_meta".into(),
+                                json!({
+                                    "terminal-auth": {
+                                        "command": "must-not-run",
+                                        "args": ["login"],
+                                    },
+                                }),
+                            ),
+                        ]),
+                    )),
                     acp_v2::AuthMethod::Agent(
                         acp_v2::AuthMethodAgent::new(Self::AUTH_METHOD_ID, "Test Login")
                             .description("Sign in with the test provider")
@@ -11126,6 +11549,160 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_restore_scroll_position_survives_deferred_markdown_parsing(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let repeated_destination = ListOffset {
+            item_ix: 1,
+            offset_in_item: px(80.0),
+        };
+        for (height, settle_restore, destination) in [
+            (600.0, false, None),
+            (1200.0, false, Some(ListOffset::default())),
+            (1200.0, true, Some(ListOffset::default())),
+            (1200.0, false, Some(repeated_destination)),
+            (1200.0, true, Some(repeated_destination)),
+        ] {
+            let (thread_view, cx) = setup_pending_scroll_restore(0, cx).await;
+            let list_state = thread_view.read_with(cx, |view, _| view.list_state.clone());
+            let restored = ListOffset {
+                item_ix: 5,
+                offset_in_item: px(if settle_restore { 2048.0 } else { 40.0 }),
+            };
+            if settle_restore {
+                list_state.scroll_to(restored);
+            }
+            let draw = |cx: &mut VisualTestContext| {
+                cx.draw(
+                    point(px(0.0), px(0.0)),
+                    size(px(800.0), px(height)),
+                    |_, _| thread_view.clone().into_any_element(),
+                );
+            };
+            for frame in 0..if settle_restore { 4 } else { 1 } {
+                if frame > 0 {
+                    cx.run_until_parked();
+                }
+                draw(cx);
+                assert_eq!(list_state.logical_scroll_top(), restored);
+                assert!(!list_state.is_following_tail());
+            }
+
+            let mut expected = restored;
+            if let Some(destination) = destination {
+                expected = destination;
+                thread_view.update(cx, |view, cx| view.scroll_to_top(cx));
+                draw(cx);
+                assert_eq!(list_state.logical_scroll_top(), ListOffset::default());
+                assert!(!list_state.is_following_tail());
+                assert!(thread_view.read_with(cx, |view, cx| {
+                    view.thread
+                        .read(cx)
+                        .entries()
+                        .get(1)
+                        .is_some_and(|entry| entry.has_pending_markdown_render(cx))
+                }));
+
+                if destination != ListOffset::default() {
+                    for target in [
+                        ListOffset {
+                            item_ix: 3,
+                            offset_in_item: px(20.0),
+                        },
+                        destination,
+                    ] {
+                        list_state.scroll_to(target);
+                        draw(cx);
+                        assert_eq!(list_state.logical_scroll_top(), target);
+                        assert!(!list_state.is_following_tail());
+                    }
+                }
+            }
+
+            for _ in 0..3 {
+                draw(cx);
+                cx.run_until_parked();
+                assert_eq!(list_state.logical_scroll_top(), expected);
+                assert!(!list_state.is_following_tail());
+            }
+            assert_eq!(
+                list_state
+                    .bounds_for_item(expected.item_ix)
+                    .map(|bounds| bounds.top()),
+                Some(list_state.viewport_bounds().top() - expected.offset_in_item),
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_scroll_to_end_during_pending_restore_renders_bottom(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (thread_view, cx) = setup_pending_scroll_restore(0, cx).await;
+        let list_state = thread_view.read_with(cx, |view, _| view.list_state.clone());
+        draw_restored_thread(&thread_view, cx);
+        assert!(!list_state.is_following_tail());
+
+        thread_view.update(cx, |view, cx| view.scroll_to_end(cx));
+        assert_eq!(
+            list_state.logical_scroll_top(),
+            ListOffset {
+                item_ix: 8,
+                offset_in_item: px(0.0),
+            },
+        );
+        for _ in 0..3 {
+            draw_restored_thread(&thread_view, cx);
+            assert!(list_state.is_following_tail());
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            list_state.bounds_for_item(7).map(|bounds| bounds.bottom()),
+            Some(list_state.viewport_bounds().bottom()),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_scrollbar_drag_cancels_pending_restore(cx: &mut TestAppContext) {
+        init_test(cx);
+        for draw_during_drag in [false, true] {
+            let (thread_view, cx) = setup_pending_scroll_restore(40, cx).await;
+            let list_state = thread_view.read_with(cx, |view, _| view.list_state.clone());
+            let restored = ListOffset {
+                item_ix: 5,
+                offset_in_item: px(40.0),
+            };
+            draw_restored_thread(&thread_view, cx);
+            list_state.scrollbar_drag_started();
+            if draw_during_drag {
+                draw_restored_thread(&thread_view, cx);
+            }
+            assert_eq!(list_state.logical_scroll_top(), restored);
+            assert!(!list_state.is_following_tail());
+            list_state.set_offset_from_scrollbar(point(px(0.0), px(-100_000.0)));
+            list_state.scrollbar_drag_ended();
+            assert!(list_state.is_following_tail());
+            assert_eq!(
+                list_state.logical_scroll_top(),
+                ListOffset {
+                    item_ix: 48,
+                    offset_in_item: px(0.0),
+                },
+            );
+
+            for _ in 0..3 {
+                draw_restored_thread(&thread_view, cx);
+                assert!(list_state.is_following_tail());
+                cx.run_until_parked();
+            }
+            assert_eq!(
+                list_state.bounds_for_item(47).map(|bounds| bounds.bottom()),
+                Some(list_state.viewport_bounds().bottom()),
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_scroll_to_most_recent_user_prompt_falls_back_to_bottom_without_user_messages(
         cx: &mut TestAppContext,
     ) {
@@ -11569,7 +12146,7 @@ pub(crate) mod tests {
     async fn test_keyed_updates_preserve_unchanged_thought_scroll_position(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -11678,7 +12255,7 @@ pub(crate) mod tests {
     async fn test_keyed_thought_snapshot_keeps_expansion_on_original_chunk(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -12315,7 +12892,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_new_patch_hunk_auto_expands_only_on_creation(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         cx.update(|cx| {
@@ -12405,7 +12982,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_awaiting_authorization_searches_visible_patch_content(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         cx.update(|cx| {
@@ -12521,7 +13098,7 @@ pub(crate) mod tests {
     async fn test_thread_search_tracks_shared_tool_patch_content_and_raw_fallback(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -12952,7 +13529,7 @@ pub(crate) mod tests {
         thread
             .update(cx, |thread, cx| {
                 thread.append_tool_call_content_chunk(
-                    acp_v2::ToolCallContentChunk::new("historical-chunks", "New mango chunk"),
+                    acp_v2::ToolCallContentChunk::new("historical-chunks", " New mango chunk"),
                     cx,
                 )
             })
@@ -12963,21 +13540,23 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert_eq!(
             search_bar.read_with(cx, |bar, _| bar.match_source_ranges()),
-            vec![9..14, 4..9],
+            vec![9..14, 26..31],
             "the active query must refresh without an explicit update_matches",
         );
         thread.read_with(cx, |thread, cx| {
             assert_eq!(thread.entries().len(), entry_count);
             let (index, call) = thread.tool_call(&tool_call_id).expect("historical tool");
             assert_eq!(index, original_index);
-            let [original, appended] = call.content() else {
-                panic!("expected original output and one appended chunk");
+            let [original] = call.content() else {
+                panic!("expected the chunk to continue the original output");
             };
             assert_eq!(original.markdown(), Some(&original_markdown));
-            assert_eq!(original_markdown.read(cx).source(), "Original mango output");
-            let appended = appended.markdown().expect("appended Markdown").read(cx);
-            assert_eq!(appended.source(), "New mango chunk");
-            assert_eq!(appended.search_highlights(), &[4..9]);
+            let original_markdown = original_markdown.read(cx);
+            assert_eq!(
+                original_markdown.source(),
+                "Original mango output New mango chunk"
+            );
+            assert_eq!(original_markdown.search_highlights(), &[9..14, 26..31]);
             let (index, later_call) = thread.tool_call(&later_tool_call_id).expect("later tool");
             assert_eq!(index, later_index);
             let [later_content] = later_call.content() else {
@@ -13643,7 +14222,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_thread_search_refreshes_older_keyed_assistant_snapshot(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -14225,6 +14804,79 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_user_message_is_editable_when_thread_can_rewind(cx: &mut TestAppContext) {
+        assert!(user_message_is_editable(StubAgentConnection::new(), false, cx).await);
+    }
+
+    #[gpui::test]
+    async fn test_user_message_is_read_only_without_truncate(cx: &mut TestAppContext) {
+        let connection = StubAgentConnection::new().with_supports_truncate(false);
+        assert!(!user_message_is_editable(connection, false, cx).await);
+    }
+
+    #[gpui::test]
+    async fn test_subagent_user_message_is_read_only(cx: &mut TestAppContext) {
+        assert!(!user_message_is_editable(StubAgentConnection::new(), true, cx).await);
+    }
+
+    async fn user_message_is_editable(
+        connection: StubAgentConnection,
+        subagent: bool,
+        cx: &mut TestAppContext,
+    ) -> bool {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let thread = if subagent {
+            let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+            let child = conversation_view.update(cx, |view, cx| {
+                create_test_acp_thread(
+                    Some(root_session_id),
+                    "child",
+                    Rc::new(connection.clone()),
+                    view.project.clone(),
+                    cx,
+                )
+            });
+            root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+            child
+        } else {
+            root
+        };
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_local_user_message(
+                    ClientUserMessageId::new(),
+                    vec!["Hello".into()],
+                    cx,
+                )
+            })
+            .expect("user message");
+        cx.run_until_parked();
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        conversation_view.read_with(cx, |view, cx| {
+            let thread_view = view.thread_view(&session_id).expect("thread view");
+            let thread_view = thread_view.read(cx);
+            let read_only = thread_view
+                .entry_view_state
+                .read(cx)
+                .entry(0)
+                .and_then(|entry| entry.message_editor())
+                .expect("user message editor")
+                .read(cx)
+                .editor()
+                .read(cx)
+                .read_only(cx);
+            let can_edit = thread_view.can_edit_user_message(0, cx);
+            assert_eq!(can_edit, !read_only);
+            can_edit
+        })
+    }
+
+    #[gpui::test]
     async fn test_message_doesnt_send_if_empty(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -14266,7 +14918,7 @@ pub(crate) mod tests {
     async fn test_focused_read_only_keyed_user_message_refreshes_supported_snapshot(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -14354,7 +15006,7 @@ pub(crate) mod tests {
     async fn test_keyed_user_metadata_and_identical_snapshots_preserve_selection(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
         use multi_buffer::MultiBufferOffset;
 
         init_test(cx);
@@ -14417,10 +15069,10 @@ pub(crate) mod tests {
     }
 
     async fn assert_unsupported_source_message_cannot_regenerate(
-        unsupported: agent_client_protocol::schema::v2::ContentBlock,
+        unsupported: agent_client_protocol::v2::schema::ContentBlock,
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         let (conversation_view, cx) =
@@ -14513,7 +15165,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_unsupported_source_message_cannot_regenerate(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         assert_unsupported_source_message_cannot_regenerate(
             acp_v2::ContentBlock::Other(acp_v2::OtherContentBlock::new(
@@ -14527,7 +15179,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_unknown_annotation_source_message_cannot_regenerate(cx: &mut TestAppContext) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         assert_unsupported_source_message_cannot_regenerate(
             acp_v2::ContentBlock::Text(acp_v2::TextContent::new("annotated text").annotations(
@@ -14542,7 +15194,7 @@ pub(crate) mod tests {
     async fn test_regenerate_does_not_resend_fallback_after_delayed_rewind(
         cx: &mut TestAppContext,
     ) {
-        use agent_client_protocol::schema::v2 as acp_v2;
+        use agent_client_protocol::v2::schema as acp_v2;
 
         init_test(cx);
         for (cancel_before_update, cancel_after_update) in
@@ -15386,6 +16038,7 @@ pub(crate) mod tests {
                 .upsert_display_terminal(
                     "display".into(),
                     acp_thread::DisplayTerminalPatch {
+                        capabilities: Default::default(),
                         command: agent_client_protocol::schema::MaybeUndefined::Value(
                             "actual command".into(),
                         ),
@@ -15417,6 +16070,7 @@ pub(crate) mod tests {
                 .upsert_display_terminal(
                     "display".into(),
                     acp_thread::DisplayTerminalPatch {
+                        capabilities: Default::default(),
                         output: agent_client_protocol::schema::MaybeUndefined::Value(
                             acp_thread::DisplayTerminalOutput {
                                 data: b"new output".to_vec(),
@@ -15453,6 +16107,7 @@ pub(crate) mod tests {
                 .upsert_display_terminal(
                     "display".into(),
                     acp_thread::DisplayTerminalPatch {
+                        capabilities: Default::default(),
                         output: agent_client_protocol::schema::MaybeUndefined::Null,
                         exit_status: agent_client_protocol::schema::MaybeUndefined::Null,
                         ..Default::default()
@@ -16393,6 +17048,53 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_toggle_command_pattern_toggles_only_clicked_pattern(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let (thread, conversation) = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _| {
+                (view.thread.clone(), view.conversation.clone())
+            });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        // A chained command gets one pattern row per sub-command (`ls`, `git status`, `git log`).
+        let options = ToolPermissionContext::new(
+            TerminalTool::NAME,
+            vec!["ls && git status && git log".into()],
+        )
+        .build_permission_options();
+        let (request_id, _response) =
+            request_test_tool_authorization_with_options(&thread, "pipeline", options, cx);
+
+        let toggle = |pattern_index, cx: &mut VisualTestContext| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.toggle_permission_pattern(&session_id, request_id, pattern_index, cx);
+                match conversation.permission_selections.get(&request_id) {
+                    Some(thread_view::PermissionSelection::SelectedPatterns(checked)) => {
+                        let mut checked = checked.clone();
+                        checked.sort();
+                        Some(checked)
+                    }
+                    Some(thread_view::PermissionSelection::Choice(_)) => {
+                        panic!("toggling a pattern must not select a dropdown choice")
+                    }
+                    None => None,
+                }
+            })
+        };
+        // An index with no matching row must not enter pattern mode.
+        assert_eq!(toggle(99, cx), None);
+        // The first click on a row other than the first checks only that row.
+        assert_eq!(toggle(1, cx), Some(vec![1]));
+        // Later clicks add only their own row...
+        assert_eq!(toggle(0, cx), Some(vec![0, 1]));
+        // ...and remove only their own row.
+        assert_eq!(toggle(1, cx), Some(vec![0]));
+        // Unchecking the last row goes back to the default selection.
+        assert_eq!(toggle(0, cx), None);
+    }
+
+    #[gpui::test]
     async fn test_allow_button_uses_selected_granularity(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -17102,6 +17804,12 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         if with_patterns {
+            let pattern = cx
+                .debug_bounds("MENU_ITEM-Always for `cargo test` commands")
+                .expect("the rendered persistent dropdown should offer the cargo pattern");
+            cx.simulate_click(pattern.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+            // Toggling `sort` on and off must leave only `cargo test` checked.
             for _ in 0..2 {
                 let pattern = cx
                     .debug_bounds("MENU_ITEM-Always for `sort` commands")
@@ -18314,7 +19022,7 @@ pub(crate) mod tests {
         click_generic_permission(first_id, None, cx);
         assert_eq!(
             first_response.await,
-            acp_v2::RequestPermissionOutcome::Cancelled
+            acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
         );
         thread.read_with(cx, |thread, _| {
             let (_, tool) = thread.tool_call(&"permission-tool".into()).expect("tool");
@@ -18323,7 +19031,9 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_generic_tool_permission_moves_when_its_tool_arrives(cx: &mut TestAppContext) {
+    async fn test_generic_tool_permission_attaches_to_the_tool_its_subject_creates(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
@@ -18339,10 +19049,7 @@ pub(crate) mod tests {
         );
         let (request_id, response) = request_test_generic_permission(&thread, request, cx);
         cx.run_until_parked();
-        assert!(cx.debug_bounds("standalone-generic-permissions").is_some());
-        thread.read_with(cx, |thread, _| assert!(thread.entries().is_empty()));
-        upsert_permission_test_tool(&thread, "late-permission-tool", cx);
-        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| assert_eq!(thread.entries().len(), 1));
         assert!(cx.debug_bounds("standalone-generic-permissions").is_none());
         assert!(
             cx.debug_bounds("tool-call-late-permission-tool-standalone")
@@ -18489,12 +19196,6 @@ pub(crate) mod tests {
                 })),
                 Some("generic-permission-unknown-_future_subject"),
             ),
-            (
-                Some(serde_json::json!({
-                    "type": "tool_call", "toolCall": {"toolCallId": "unseen-tool"}
-                })),
-                None,
-            ),
         ] {
             let request = generic_permission_prompt(&thread, subject, cx);
             let (request_id, response) =
@@ -18544,7 +19245,10 @@ pub(crate) mod tests {
                 );
             });
             click_generic_permission(request_id, None, cx);
-            assert_eq!(response.await, acp_v2::RequestPermissionOutcome::Cancelled);
+            assert_eq!(
+                response.await,
+                acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
+            );
             assert!(
                 cx.debug_bounds("generic-permission-title-**Permission title**")
                     .is_none()
@@ -18709,7 +19413,7 @@ pub(crate) mod tests {
         click_generic_permission(third_id, None, cx);
         assert_eq!(
             third_response.await,
-            acp_v2::RequestPermissionOutcome::Cancelled
+            acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
         );
         drop(original_root);
     }
@@ -18774,7 +19478,7 @@ pub(crate) mod tests {
         click_generic_permission(generic_id, None, cx);
         assert_eq!(
             generic_response.await,
-            acp_v2::RequestPermissionOutcome::Cancelled
+            acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
         );
         cx.focus(&thread_view);
         cx.dispatch_action(crate::AllowOnce);
@@ -18896,7 +19600,7 @@ pub(crate) mod tests {
         click_generic_permission(child_id, None, cx);
         assert_eq!(
             child_response.await,
-            acp_v2::RequestPermissionOutcome::Cancelled
+            acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
         );
         assert!(root.read_with(cx, |thread, _| thread.permission_request(root_id).is_some()));
         conversation_view.update_in(cx, |view, window, cx| {
@@ -18906,7 +19610,7 @@ pub(crate) mod tests {
         click_generic_permission(root_id, None, cx);
         assert_eq!(
             root_response.await,
-            acp_v2::RequestPermissionOutcome::Cancelled
+            acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
         );
     }
 
@@ -19000,7 +19704,7 @@ pub(crate) mod tests {
             click_generic_permission(later_id, None, cx);
             assert_eq!(
                 later_response.await,
-                acp_v2::RequestPermissionOutcome::Cancelled
+                acp_v2::RequestPermissionOutcome::Cancelled(Default::default())
             );
         }
         root.read_with(cx, |thread, _| assert!(thread.entries().is_empty()));
@@ -19926,6 +20630,640 @@ pub(crate) mod tests {
         }
     }
 
+    fn create_test_acp_subagent(
+        parent_session_id: acp_v2::SessionId,
+        session_id: &str,
+        connection: Rc<dyn AgentConnection>,
+        project: Entity<Project>,
+        cx: &mut App,
+    ) -> Entity<AcpThread> {
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        cx.new(|cx| {
+            AcpThread::new(
+                Some(parent_session_id),
+                None,
+                None,
+                connection,
+                project,
+                action_log,
+                acp_v2::SessionId::new(session_id),
+                watch::Receiver::constant(acp_v2::PromptCapabilities::new()),
+                cx,
+            )
+            .agent_owned()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_subagent_label_prefers_the_acp_parents_title(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let (native_child, acp_child) = cx.update(|cx| {
+            let parent = acp_v2::SessionId::new("parent");
+            (
+                create_test_acp_thread(
+                    Some(parent.clone()),
+                    "native-child",
+                    connection.clone(),
+                    project.clone(),
+                    cx,
+                ),
+                create_test_acp_subagent(parent, "acp-child", connection, project, cx),
+            )
+        });
+        let label = |thread: &Entity<AcpThread>, cx: &mut TestAppContext| {
+            thread.read_with(cx, |thread, _| thread_view::subagent_label(thread))
+        };
+        assert_eq!(label(&native_child, cx), "Subagent");
+
+        for thread in [&native_child, &acp_child] {
+            thread.update(cx, |thread, cx| {
+                thread.update_session_info(acp_v2::SessionInfoUpdate::new().title("Own title"), cx)
+            });
+        }
+        assert_eq!(label(&native_child, cx), "Own title");
+        assert_eq!(label(&acp_child, cx), "Own title");
+
+        acp_child.update(cx, |thread, cx| {
+            thread
+                .update_subagent_association(
+                    &acp_v2::SubagentUpdate::new("acp-child").title("Parent title"),
+                    cx,
+                )
+                .expect("ACP subagent")
+        });
+        assert_eq!(label(&acp_child, cx), "Parent title");
+    }
+
+    #[gpui::test]
+    async fn test_session_message_participant_opens_its_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_subagent(
+                root_session_id.clone(),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        child.update(cx, |child, cx| {
+            child
+                .update_subagent_association(
+                    &acp_v2::SubagentUpdate::new("child").title("Investigator"),
+                    cx,
+                )
+                .expect("ACP subagent")
+        });
+        // Each ACP notification is applied in its own update, as here.
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        // The subagent's own view of its reply sits between entries that overflow the view.
+        let long_text = vec!["Working on it"; 40].join("\n\n");
+        for message_id in ["work-1", "work-2", "work-3", "reply", "work-4", "work-5"] {
+            child
+                .update(cx, |child, cx| {
+                    if message_id == "reply" {
+                        child.upsert_session_message(
+                            acp_v2::SessionMessage::new("reply")
+                                .sender_session_id(acp_v2::SessionId::new("child"))
+                                .recipient_session_id(root_session_id.clone())
+                                .content(vec!["Found it".into()]),
+                            cx,
+                        )
+                    } else {
+                        child.upsert_user_message(
+                            acp_v2::UserMessage::new(message_id)
+                                .content(vec![long_text.as_str().into()]),
+                            cx,
+                        )
+                    }
+                })
+                .expect("subagent entry");
+        }
+        // An outgoing message to a subagent is its card, so this test uses its reply.
+        root.update(cx, |root, cx| {
+            root.upsert_session_message(
+                acp_v2::SessionMessage::new("from-child")
+                    .sender_session_id(acp_v2::SessionId::new("child"))
+                    .recipient_session_id(root_session_id.clone())
+                    .sender_message_id(acp_v2::MessageId::new("reply"))
+                    .content(vec!["Found it".into()]),
+                cx,
+            )
+        })
+        .expect("incoming message");
+        root.update(cx, |root, cx| {
+            root.upsert_session_message(
+                acp_v2::SessionMessage::new("from-unknown")
+                    .sender_session_id(acp_v2::SessionId::new("unknown"))
+                    .recipient_session_id(root_session_id.clone())
+                    .content(vec!["Hello".into()]),
+                cx,
+            )
+        })
+        .expect("incoming message");
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            for (session_id, expected) in [
+                ("child", Some("Investigator")),
+                (root_session_id.0.as_ref(), Some("Main Agent")),
+                ("unknown", None),
+            ] {
+                assert_eq!(
+                    view.session_participant_label(&acp_v2::SessionId::new(session_id), cx),
+                    expected.map(SharedString::from),
+                    "{session_id}"
+                );
+            }
+        });
+        assert!(
+            cx.debug_bounds("session-message-participant-1").is_none(),
+            "an unknown participant is not a link"
+        );
+        let link = cx
+            .debug_bounds("session-message-participant-0")
+            .expect("the sender links to its session");
+        cx.simulate_click(link.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let (active_session_id, scroll_top) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                (
+                    view.thread.read(cx).session_id().clone(),
+                    view.list_state.logical_scroll_top().item_ix,
+                )
+            });
+        assert_eq!(active_session_id, acp_v2::SessionId::new("child"));
+        assert_eq!(
+            scroll_top, 3,
+            "the link opens the subagent at its view of the message"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_session_reference_opens_its_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_subagent(
+                root_session_id.clone(),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        child.update(cx, |child, cx| {
+            child
+                .update_subagent_association(
+                    &acp_v2::SubagentUpdate::new("child").title("Investigator"),
+                    cx,
+                )
+                .expect("ACP subagent")
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        root.update(cx, |root, cx| {
+            root.upsert_wire_tool_call(
+                acp_v2::ToolCallUpdate::new("delegate")
+                    .title("Delegate")
+                    .status(acp_v2::ToolCallStatus::Completed)
+                    .content(vec![
+                        acp_v2::SessionReference::new("child").into(),
+                        acp_v2::SessionReference::new("unknown").into(),
+                    ]),
+                cx,
+            )
+        })
+        .expect("tool call");
+        conversation_view.update(cx, |view, cx| view.expand_tool_call("delegate".into(), cx));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("tool-call-session-reference-0-1").is_none(),
+            "an unknown session is not a link"
+        );
+        let link = cx
+            .debug_bounds("tool-call-session-reference-0-0")
+            .expect("the reference links to its session");
+        cx.simulate_click(link.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let active_session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        assert_eq!(active_session_id, acp_v2::SessionId::new("child"));
+    }
+
+    #[gpui::test]
+    async fn test_first_message_to_an_acp_subagent_shows_its_card(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_subagent(
+                root_session_id.clone(),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        child.update(cx, |child, cx| {
+            child
+                .update_subagent_association(
+                    &acp_v2::SubagentUpdate::new("child").title("Investigator"),
+                    cx,
+                )
+                .expect("ACP subagent")
+        });
+        child.update(cx, |child, cx| {
+            child
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("reported state")
+        });
+        // Each ACP notification is applied in its own update, as here.
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        for (message_id, text) in [
+            ("launch", "Check the failure"),
+            ("follow-up", "Also check Windows"),
+        ] {
+            root.update(cx, |root, cx| {
+                root.upsert_session_message(
+                    acp_v2::SessionMessage::new(message_id)
+                        .sender_session_id(root_session_id.clone())
+                        .recipient_session_id(acp_v2::SessionId::new("child"))
+                        .content(vec![text.into()]),
+                    cx,
+                )
+            })
+            .expect("outgoing message");
+        }
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("subagent-card-0").is_some(),
+            "the first message to the subagent is its card"
+        );
+        assert!(
+            cx.debug_bounds("subagent-card-1").is_none()
+                && cx.debug_bounds("session-message-participant-1").is_some(),
+            "a later message to the same subagent stays a row"
+        );
+        assert!(
+            cx.debug_bounds("stop-subagent-0").is_none(),
+            "a subagent that does not advertise cancel cannot be stopped"
+        );
+
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+        let bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("search bar");
+        bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("check", window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            bar.read_with(cx, |bar, _| bar.match_count()),
+            1,
+            "the card does not show its message, so only the row's text matches"
+        );
+
+        child.update(cx, |child, cx| {
+            child
+                .update_subagent_association(
+                    &acp_v2::SubagentUpdate::new("child").capabilities(
+                        acp_v2::SubagentSessionCapabilities::new()
+                            .cancel(acp_v2::SessionCancelCapabilities::new()),
+                    ),
+                    cx,
+                )
+                .expect("ACP subagent")
+        });
+        cx.run_until_parked();
+        let stop = cx
+            .debug_bounds("stop-subagent-0")
+            .expect("a running subagent that advertises cancel can be stopped");
+        cx.simulate_click(stop.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            connection.take_cancel_calls(),
+            vec![acp_v2::SessionId::new("child")],
+            "stopping cancels only the subagent"
+        );
+
+        child.update(cx, |child, cx| {
+            child
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::Cancelled),
+                    ),
+                    cx,
+                )
+                .expect("reported state")
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("stop-subagent-0").is_none(),
+            "an idle subagent cannot be stopped"
+        );
+        child.read_with(cx, |child, _| {
+            let card = subagent_card::SubagentCardState::from_acp_subagent(child, None);
+            assert_eq!(card.status, subagent_card::SubagentStatus::Canceled);
+            assert_eq!(
+                card.title(Some("Own title".into())).as_ref(),
+                "Investigator"
+            );
+        });
+
+        // The expanded card renders the subagent's own view of the message, a row that
+        // names the parent.
+        child
+            .update(cx, |child, cx| {
+                child.upsert_session_message(
+                    acp_v2::SessionMessage::new("task")
+                        .sender_session_id(root_session_id.clone())
+                        .recipient_session_id(acp_v2::SessionId::new("child"))
+                        .content(vec!["Check the failure".into()]),
+                    cx,
+                )
+            })
+            .expect("incoming message");
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.toggle_session_message_card_expansion(&acp_v2::MessageId::new("launch"))
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-card-0").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_each_linked_message_to_an_acp_subagent_is_its_own_card(cx: &mut TestAppContext) {
+        use subagent_card::{SubagentCardState, SubagentEntries, SubagentStatus};
+
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("child");
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_subagent(
+                root_session_id.clone(),
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        // Each ACP notification is applied in its own update, as here.
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        let to_child = |message_id: &str| {
+            acp_v2::SessionMessage::new(message_id)
+                .sender_session_id(root_session_id.clone())
+                .recipient_session_id(child_session_id.clone())
+                .content(vec![message_id.into()])
+        };
+        let delegate = |sent: &str, received: &str, cx: &mut VisualTestContext| {
+            root.update(cx, |root, cx| {
+                root.upsert_session_message(
+                    to_child(sent).recipient_message_id(acp_v2::MessageId::new(received)),
+                    cx,
+                )
+            })
+            .expect("outgoing view");
+            child
+                .update(cx, |child, cx| {
+                    child.upsert_session_message(
+                        to_child(received).sender_message_id(acp_v2::MessageId::new(sent)),
+                        cx,
+                    )
+                })
+                .expect("incoming view");
+        };
+        let report = |state: acp_v2::StateUpdate, cx: &mut VisualTestContext| {
+            child
+                .update(cx, |child, cx| child.update_session_state(state, cx))
+                .expect("reported state");
+        };
+        let running = || acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new());
+        // Long enough that the subagent's view overflows, so its scroll position shows.
+        let long_text = vec!["Working"; 40].join("\n\n");
+        let work = |message_id: &str, cx: &mut VisualTestContext| {
+            child
+                .update(cx, |child, cx| {
+                    child.upsert_assistant_message(
+                        acp_v2::AgentMessage::new(message_id)
+                            .content(vec![long_text.as_str().into()]),
+                        cx,
+                    )
+                })
+                .expect("subagent work");
+        };
+        let cards = |cx: &mut VisualTestContext| {
+            root.read_with(cx, |root, cx| {
+                root.entries()
+                    .iter()
+                    .enumerate()
+                    .map(|(entry_ix, entry)| {
+                        let AgentThreadEntry::SessionMessage(message) = entry else {
+                            panic!("expected session messages, got {entry:?}");
+                        };
+                        subagent_card::acp_subagent_card(root, entry_ix, message, cx).map(|card| {
+                            let state = SubagentCardState::from_acp_subagent(
+                                card.subagent.read(cx),
+                                card.entries,
+                            );
+                            (card.entries, state.status)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let entries = |start, end| Some(SubagentEntries { start, end });
+
+        delegate("launch", "task-1", cx);
+        report(running(), cx);
+        work("work-1", cx);
+        // The second message arrives while the subagent still works on the first.
+        delegate("follow-up", "task-2", cx);
+        work("work-2", cx);
+        assert_eq!(
+            cards(cx),
+            vec![
+                Some((entries(0, Some(1)), SubagentStatus::Running)),
+                Some((entries(2, None), SubagentStatus::Running)),
+            ],
+            "each message covers its part of the subagent, and an earlier one without an \
+             outcome yet shows the current state"
+        );
+
+        report(
+            acp_v2::StateUpdate::Idle(
+                acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::Refusal),
+            ),
+            cx,
+        );
+        delegate("retry", "task-3", cx);
+        report(running(), cx);
+        // A later message the subagent's view does not link to stays a row.
+        root.update(cx, |root, cx| {
+            root.upsert_session_message(to_child("unlinked"), cx)
+        })
+        .expect("outgoing view");
+        assert_eq!(
+            cards(cx),
+            vec![
+                Some((entries(0, Some(1)), SubagentStatus::Failed)),
+                Some((entries(2, Some(3)), SubagentStatus::Failed)),
+                Some((entries(4, None), SubagentStatus::Running)),
+                None,
+            ],
+            "an earlier message shows the first outcome after it"
+        );
+
+        cx.run_until_parked();
+        for selector in ["subagent-card-0", "subagent-card-1", "subagent-card-2"] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+        }
+        assert!(
+            cx.debug_bounds("subagent-card-3").is_none()
+                && cx.debug_bounds("session-message-participant-3").is_some(),
+            "the unlinked message is drawn as a row"
+        );
+
+        let parent_view = active_thread(&conversation_view, cx);
+        let child_view = conversation_view
+            .read_with(cx, |view, _| view.thread_view(&child_session_id))
+            .expect("subagent view");
+        let child_scroll_top = |cx: &mut VisualTestContext| {
+            child_view.read_with(cx, |view, _| view.list_state.logical_scroll_top())
+        };
+        let open_fullscreen = |message_id: &str,
+                               selector: &'static str,
+                               cx: &mut VisualTestContext| {
+            conversation_view.update_in(cx, |view, window, cx| {
+                view.navigate_to_thread(root_session_id.clone(), window, cx)
+            });
+            parent_view.update(cx, |view, cx| {
+                view.entry_view_state.update(cx, |state, _| {
+                    if !state.is_session_message_card_expanded(&acp_v2::MessageId::new(message_id))
+                    {
+                        state.toggle_session_message_card_expansion(&acp_v2::MessageId::new(
+                            message_id,
+                        ));
+                    }
+                });
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let toggle = cx.debug_bounds(selector).expect("full screen button");
+            cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(active_thread(&conversation_view, cx), child_view);
+        };
+
+        child_view.update(cx, |view, cx| view.scroll_to_entry(4, cx));
+        open_fullscreen("follow-up", "subagent-fullscreen-1", cx);
+        assert_eq!(
+            child_scroll_top(cx).item_ix,
+            2,
+            "a stopped card opens at the start of its part"
+        );
+
+        child_view.update(cx, |view, cx| view.scroll_to_entry(3, cx));
+        open_fullscreen("retry", "subagent-fullscreen-2", cx);
+        assert_eq!(
+            child_scroll_top(cx).item_ix,
+            3,
+            "a running card leaves the subagent where it was"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_acp_subagent_titlebar_stops_only_with_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = conversation_view.update(cx, |view, cx| {
+            create_test_acp_subagent(
+                root_session_id,
+                "child",
+                Rc::new(connection.clone()),
+                view.project.clone(),
+                cx,
+            )
+        });
+        child.update(cx, |child, cx| {
+            child
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("reported state")
+        });
+        root.update(cx, |root, cx| root.register_subagent(child.clone(), cx));
+        cx.run_until_parked();
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(acp_v2::SessionId::new("child"), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("subagent-titlebar-stop").is_none(),
+            "a running subagent that does not advertise cancel cannot be stopped"
+        );
+
+        child.update(cx, |child, cx| {
+            child
+                .update_subagent_association(
+                    &acp_v2::SubagentUpdate::new("child").capabilities(
+                        acp_v2::SubagentSessionCapabilities::new()
+                            .cancel(acp_v2::SessionCancelCapabilities::new()),
+                    ),
+                    cx,
+                )
+                .expect("ACP subagent")
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-titlebar-stop").is_some());
+    }
+
     #[gpui::test]
     async fn test_release_policy_does_not_disable_explicit_close(cx: &mut TestAppContext) {
         init_test(cx);
@@ -20080,6 +21418,84 @@ pub(crate) mod tests {
         assert!(
             result.unwrap_err().to_string().contains("not supported"),
             "Error message should indicate that closing is not supported"
+        );
+    }
+
+    async fn setup_pending_scroll_restore(
+        tool_call_count: usize,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ThreadView>, &mut VisualTestContext) {
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let conversation = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _| view.conversation.clone());
+        let thread = conversation_view.update(cx, |view, cx| {
+            create_test_acp_thread(
+                None,
+                "restore-scroll",
+                Rc::new(StubAgentConnection::new()),
+                view.project.clone(),
+                cx,
+            )
+        });
+
+        let reply = "Long reply line.\n\n".repeat(200);
+        let result = thread.update(cx, |thread, cx| -> Result<()> {
+            for turn in 0..4 {
+                thread.handle_session_update(
+                    acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk::new(
+                        format!("Prompt {turn}").into(),
+                    )),
+                    cx,
+                )?;
+                thread.handle_session_update(
+                    acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        reply.clone().into(),
+                    )),
+                    cx,
+                )?;
+            }
+            for index in 0..tool_call_count {
+                thread.handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(
+                            acp_v1::ToolCallId::new(format!("tool-{index}")),
+                            format!("Tool {index}"),
+                        )
+                        .kind(acp_v1::ToolKind::Other)
+                        .status(acp_v1::ToolCallStatus::Completed),
+                    ),
+                    cx,
+                )?;
+            }
+            assert_eq!(thread.entries().len(), 8 + tool_call_count);
+            assert!(matches!(
+                thread.entries().get(5),
+                Some(AgentThreadEntry::AssistantMessage(_))
+            ));
+            thread.set_ui_scroll_position(Some(ListOffset {
+                item_ix: 5,
+                offset_in_item: px(40.0),
+            }));
+            Ok(())
+        });
+        assert!(result.is_ok(), "{result:?}");
+
+        let thread_view = conversation_view.update_in(cx, |view, window, cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(thread.clone(), cx);
+            });
+            view.new_thread_view(thread, conversation, false, None, window, cx)
+        });
+        (thread_view, cx)
+    }
+
+    fn draw_restored_thread(thread_view: &Entity<ThreadView>, cx: &mut VisualTestContext) {
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(800.0), px(600.0)),
+            |_, _| thread_view.clone().into_any_element(),
         );
     }
 
