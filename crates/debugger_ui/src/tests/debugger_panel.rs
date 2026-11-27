@@ -1986,6 +1986,53 @@ async fn test_debug_adapters_shutdown_on_app_quit(
 }
 
 #[gpui::test]
+async fn test_shutdown_kills_adapter_that_never_confirms(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(path!("/project"), json!({ "main.rs": "First line" }))
+        .await;
+
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    client.on_request_ext::<Disconnect, _>(|_, _| dap::transport::RequestHandling::NoResponse);
+    executor.run_until_parked();
+
+    use futures::FutureExt as _;
+    let mut shutdown = session.update(cx, |session, cx| session.shutdown(cx));
+    executor.run_until_parked();
+    assert!(
+        (&mut shutdown).now_or_never().is_none(),
+        "the adapter gets time to confirm the shutdown"
+    );
+
+    executor.advance_clock(std::time::Duration::from_secs(5));
+    executor.run_until_parked();
+    assert!(
+        shutdown.now_or_never().is_some(),
+        "shutdown completes once the adapter has been given up on"
+    );
+    assert!(
+        client
+            .request::<Disconnect>(dap::DisconnectArguments {
+                restart: None,
+                terminate_debuggee: None,
+                suspend_debuggee: None,
+            })
+            .await
+            .is_err(),
+        "the adapter client is closed after the kill"
+    );
+}
+
+#[gpui::test]
 async fn test_breakpoint_jumps_only_in_proper_split_view(
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,

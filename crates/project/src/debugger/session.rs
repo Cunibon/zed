@@ -69,6 +69,10 @@ use worktree::Worktree;
 
 const MAX_TRACKED_OUTPUT_EVENTS: usize = 5000;
 const DEBUG_HISTORY_LIMIT: usize = 10;
+/// How long a debug adapter gets to answer the terminate or disconnect request
+/// before its process is killed. Flutter's adapter waits for `flutter run` to
+/// confirm the stop without a timeout of its own, so a hung run never answers.
+const ADAPTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, PartialOrd, Ord, Eq)]
 #[repr(transparent)]
@@ -2290,7 +2294,18 @@ impl Session {
         cx.emit(SessionStateEvent::Shutdown);
 
         cx.spawn(async move |this, cx| {
-            task.await;
+            let mut timeout = cx
+                .background_executor()
+                .timer(ADAPTER_SHUTDOWN_TIMEOUT)
+                .fuse();
+            futures::select_biased! {
+                _ = task.fuse() => {}
+                _ = timeout => {
+                    log::warn!(
+                        "debug adapter did not confirm the shutdown within {ADAPTER_SHUTDOWN_TIMEOUT:?}, killing it"
+                    );
+                }
+            }
             let _ = this.update(cx, |this, _| {
                 if let Some(adapter_client) = this.adapter_client() {
                     adapter_client.kill();

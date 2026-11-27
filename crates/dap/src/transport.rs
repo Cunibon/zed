@@ -52,6 +52,8 @@ pub enum IoKind {
 #[cfg(any(test, feature = "test-support"))]
 pub enum RequestHandling<T> {
     Respond(T),
+    /// Leaves the request unanswered, like an adapter that hangs.
+    NoResponse,
     Exit,
 }
 
@@ -820,8 +822,10 @@ impl FakeTransport {
             R::COMMAND,
             Box::new(move |seq, args| {
                 let result = handler(seq, serde_json::from_value(args).unwrap());
-                let RequestHandling::Respond(response) = result else {
-                    return RequestHandling::Exit;
+                let response = match result {
+                    RequestHandling::Respond(response) => response,
+                    RequestHandling::NoResponse => return RequestHandling::NoResponse,
+                    RequestHandling::Exit => return RequestHandling::Exit,
                 };
                 let response = match response {
                     Ok(response) => Response {
@@ -918,6 +922,7 @@ impl FakeTransport {
                                 };
                                 let response = match response {
                                     RequestHandling::Respond(response) => response,
+                                    RequestHandling::NoResponse => continue,
                                     RequestHandling::Exit => {
                                         break Err(anyhow!("exit in response to request"));
                                     }
